@@ -4,7 +4,10 @@
 #
 # Fail-open by construction: every failure path exits 0 with NO stdout, which
 # Claude Code reads as "no decision" and the spawn proceeds untouched.
-# Env: NADIR_BUCKET_URL, NADIR_AGENT_POLICY (raw JSON), NADIR_ROUTE_DISABLE=1.
+# Env: NADIR_BUCKET_URL, NADIR_AGENT_POLICY (raw JSON), NADIR_ROUTE_DISABLE=1,
+# NADIR_API_KEY (keyed mode: your account's saved agent policy governs the
+# decision and it shows up in the dashboard's Engine decisions; an explicit
+# NADIR_AGENT_POLICY still wins over the account policy).
 
 [ "$NADIR_ROUTE_DISABLE" = "1" ] && exit 0
 
@@ -19,22 +22,32 @@ except Exception:
     raise SystemExit
 if not prompt:
     raise SystemExit
-try:
-    policy = json.loads(os.environ["NADIR_AGENT_POLICY"])
-except Exception:
-    policy = {"subagent": "auto"}
-print(json.dumps({
+body = {
     "prompt": prompt,
     "role": "subagent",
     "requested_model": ti.get("model") or "",
-    "agent_policy": policy,
-}))
+}
+try:
+    body["agent_policy"] = json.loads(os.environ["NADIR_AGENT_POLICY"])
+except Exception:
+    # Keyed calls inherit the account policy server-side; keyless ones have
+    # no account, so default to letting the router decide.
+    if not os.environ.get("NADIR_API_KEY"):
+        body["agent_policy"] = {"subagent": "auto"}
+print(json.dumps(body))
 ') || exit 0
 [ -n "$req" ] || exit 0
 
-resp=$(printf '%s' "$req" | curl -s -f -m 2 -X POST \
-    "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
-    -H 'Content-Type: application/json' --data-binary @-) || exit 0
+if [ -n "$NADIR_API_KEY" ]; then
+    resp=$(printf '%s' "$req" | curl -s -f -m 2 -X POST \
+        "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
+        -H 'Content-Type: application/json' -H "X-API-Key: $NADIR_API_KEY" \
+        --data-binary @-) || exit 0
+else
+    resp=$(printf '%s' "$req" | curl -s -f -m 2 -X POST \
+        "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
+        -H 'Content-Type: application/json' --data-binary @-) || exit 0
+fi
 
 printf '%s' "$resp" | NADIR_HOOK_INPUT="$hook_input" python3 -c '
 import json, os, sys

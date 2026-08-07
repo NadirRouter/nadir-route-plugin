@@ -28,6 +28,7 @@ a permission rule (`Agent(model:opus)` in `permissions.deny`).
 | --- | --- | --- |
 | `NADIR_ROUTE_DISABLE` | unset | `1` turns the hook off entirely |
 | `NADIR_BUCKET_URL` | `https://api.getnadir.com/v1/bucket` | decision endpoint |
+| `NADIR_API_KEY` | unset | keyed mode: your account's saved agent policy governs the decision (an explicit `NADIR_AGENT_POLICY` still wins) and decisions appear in the dashboard's Engine decisions. Keyless mode defaults to `{"subagent":"auto"}`. |
 | `NADIR_AGENT_POLICY` | `{"subagent":"auto"}` | Claude Code only: raw JSON role policy; `auto` = let the router pick, or pin a value (`{"subagent":"haiku"}`). The Codex script routes by tier via `NADIR_CODEX_LADDER` and ignores this. |
 
 Both scripts need `python3` on PATH for JSON handling; without it every path exits silently and spawns proceed unrouted.
