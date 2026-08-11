@@ -1,157 +1,115 @@
-# Agent hooks: the agent routes its own spawns
+# nadir-route
 
-A `PreToolUse` hook on the subagent-spawn tool asks Nadir's free decision API
-(`POST https://api.getnadir.com/v1/bucket`, keyless) which model the task needs,
-then rewrites `model` in the spawn's input. The main thread is never touched,
-by construction: the hook only fires on spawns.
+Right-size Claude Code's subagent spawns. A `PreToolUse` hook on the `Agent`
+tool asks [Nadir](https://getnadir.com)'s free decision API which model the task
+actually needs, then rewrites `model` in the spawn's input.
 
-```
-claude-code/    Claude Code plugin (plugin.json + hooks/hooks.json + scripts/ + skills/)
-codex/          ~/.codex hooks.json + route-spawn.sh
-```
-
-## Fail-open contract
-
-Both scripts exit 0 with **no stdout** on every failure path: disabled, empty
-prompt, unparseable stdin, bad policy JSON, curl network error, curl timeout
-(`-m 2`), non-200 (`curl -f`), missing decision field, or a model equal to the
-one already requested. Claude Code and Codex read "exit 0, no output" as *no
-decision*, so the spawn proceeds exactly as the agent intended. Only exit code 2
-blocks a tool call, and neither script can produce it.
-
-This hook is a nudge, not a control. To *enforce* a model ceiling, back it with
-a permission rule (`Agent(model:opus)` in `permissions.deny`).
-
-## Env knobs (both agents)
-
-| Var | Default | Meaning |
-| --- | --- | --- |
-| `NADIR_ROUTE_DISABLE` | unset | `1` turns the hook off entirely |
-| `NADIR_BUCKET_URL` | `https://api.getnadir.com/v1/bucket` | decision endpoint |
-| `NADIR_API_KEY` | unset | keyed mode: your account's saved agent policy governs the decision (an explicit `NADIR_AGENT_POLICY` still wins) and decisions appear in the dashboard's Engine decisions. Keyless mode defaults to `{"subagent":"auto"}`. |
-| `NADIR_AGENT_POLICY` | `{"subagent":"auto"}` | Claude Code only: raw JSON role policy; `auto` = let the router pick, or pin a value (`{"subagent":"haiku"}`). The Codex script routes by tier via `NADIR_CODEX_LADDER` and ignores this. |
-
-Both scripts need `python3` on PATH for JSON handling; without it every path exits silently and spawns proceed unrouted.
-| `NADIR_CODEX_LADDER` | unset | **Codex only.** JSON tier→slug map; unset means pass through untouched |
-
-## Claude Code
-
-Tool name is `Agent` (`Task` still works as an alias). The hook receives
-`tool_input` `{prompt, description, subagent_type, model}` and returns
-`hookSpecificOutput.updatedInput`, which **replaces the whole input object** —
-the script echoes every field it received and only adds `model`.
-
-**Precedence caveat:** `CLAUDE_CODE_SUBAGENT_MODEL` outranks the per-invocation
-`model` the hook writes. If it is set to anything other than `inherit`, this hook
-does nothing. The hook does beat a subagent's frontmatter `model`, including
-`model: inherit`.
-
-### Install: plugin (one command, once the plugin repo is published)
+Nadir is a **decision engine here, not a gateway**. Your prompts and completions
+go straight from Claude Code to Anthropic on your own auth; Nadir is consulted
+out of band with the spawn's task text and never sees the request, the response,
+or a provider key. There is no added latency on the token stream.
 
 ```bash
 claude plugin marketplace add https://getnadir.com/marketplace.json
 claude plugin install nadir-route@nadir
 ```
 
-When mirroring `claude-code/` into that repo, set the exec bit through git —
-this repo has `core.fileMode` off, so a plain `chmod +x` is silently dropped and
-the hook lands non-executable:
+No key required. Add one to attribute decisions to your account and get a
+savings figure on the dashboard (see below).
+
+## What it does
+
+| Nadir's bucket | the hook writes | effect |
+| --- | --- | --- |
+| `simple` | `haiku` | your cheapest model |
+| `medium` | `sonnet` | your default working model |
+| `complex` | **nothing** | the spawn keeps the model the session already runs |
+
+Three rules, all deliberate:
+
+- **`complex` is never rewritten.** The top tier stays on the model you chose,
+  including which Opus generation. Nadir right-sizes the cheap end; it does not
+  move you off your frontier model.
+- **It only writes harness aliases.** `Agent`'s `model` parameter is an enum
+  (`haiku`, `sonnet`, `opus`, `fable`), and Claude Code converts a schema-invalid
+  hook rewrite into a *denied* tool call. Aliases also resolve through your own
+  `ANTHROPIC_DEFAULT_*_MODEL` config, so a routed spawn lands in your family and
+  your generation rather than one this plugin hardcoded.
+- **It never moves a spawn up.** If the agent already asked for something
+  cheaper than the routed tier, that stands.
+
+Your main thread is never touched, by construction: the hook fires only on
+spawns.
+
+Measured end to end on Claude Code 2.1.220 — a trivial read bucketed `medium`
+and the subagent started on `claude-sonnet-5` (from an Opus inherit); a
+multi-region failover design bucketed `complex`, the hook emitted nothing, and
+the subagent ran on `claude-opus-5`.
+
+## Configuration
+
+Set these in `~/.claude/settings.json` under `env`, or export them.
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `NADIR_ROUTE_DISABLE` | unset | `1` turns the hook off |
+| `NADIR_BASELINE_MODEL` | unset | the model your sessions run on, e.g. `claude-opus-5`. **Set this for a savings figure**: Claude Code fills `tool_input.model` only when a spawn names one explicitly, so without it Nadir has no baseline to price against and decisions log unpriced |
+| `NADIR_API_KEY` | unset | attributes decisions to your account and surfaces them on the dashboard. Keyless calls store no row at all, by design, so your dashboard stays empty |
+| `NADIR_CLAUDE_LADDER` | `{"simple":"haiku","medium":"sonnet"}` | retune the table above. Map a tier to `inherit` to leave it alone; `{"simple":"inherit","medium":"inherit"}` is audit mode — decisions recorded, nothing changed |
+| `NADIR_AGENT_POLICY` | `{"subagent":"auto"}` keyless | raw JSON role policy. Pin a value (`{"subagent":"haiku"}`) instead of letting the router pick |
+| `NADIR_TIMEOUT` | `5` | seconds the decision call may take. Do not lower to 2: a 10-way parallel fan-out measures 1.9–2.3s per call, so a 2s cap loses most decisions in exactly the traffic this is for |
+| `NADIR_BUCKET_URL` | `https://api.getnadir.com/v1/bucket` | endpoint |
+
+Requires `python3` on PATH for JSON handling. Without it every path exits
+silently and spawns proceed unrouted.
+
+## Fail-open, and how to tell
+
+Every failure path exits 0 with **no stdout** — disabled, empty prompt,
+unparseable input, bad policy JSON, network error, timeout, non-200, missing
+decision field, a model equal to the one already requested, or a rejected key.
+Claude Code reads that as "no decision" and the spawn proceeds exactly as the
+agent intended. Only exit code 2 blocks a tool call, and this script cannot
+produce one.
+
+The cost of that design is that "working" and "doing nothing" look identical, so
+check explicitly rather than assuming:
 
 ```bash
-git update-index --chmod=+x scripts/route-spawn.sh
+echo '{"tool_name":"Agent","tool_input":{"prompt":"rename a variable in one file","description":"rename var","subagent_type":"Explore"}}' \
+  | sh ~/.claude/plugins/*/nadir-route/scripts/route-spawn.sh
 ```
 
-`app/public/marketplace.json` carries a loud `_comment`: a URL marketplace
-downloads only `marketplace.json`, so the plugin `source` must be absolute. It
-points at `NadirRouter/nadir-route-plugin`, which must exist and mirror
-`claude-code/` before the marketplace is announced. Publishing it is a founder step.
+Expect JSON containing `"model":"haiku"`. Empty output means it is not routing.
+An invalid `NADIR_API_KEY` produces exactly the same silence as an unreachable
+network, so if you are keyed, re-run the same check with `NADIR_API_KEY=` — if it
+starts working, your key is being rejected.
 
-### Install: bare settings.json (no plugin, works today)
+Inside a session, Claude Code's `PostToolUse` `tool_response.resolvedModel`
+names the model a subagent actually started on.
+
+## Precedence traps
+
+- `CLAUDE_CODE_SUBAGENT_MODEL`, if set to anything but `inherit`, outranks the
+  per-invocation model this hook writes — the hook silently does nothing.
+- The hook does beat a subagent's frontmatter `model`, including `model: inherit`.
+- This is a nudge, not a control. Claude Code's `Agent` permission rules match
+  the agent *type*, not the model, so there is no local way to enforce a ceiling.
+
+## Alternative install
+
+One command, no plugin, same hook — it merges into `settings.json`, backs it up,
+and verifies routing is live before it exits:
 
 ```bash
-mkdir -p ~/.claude/nadir
-cp integrations/agent-hooks/claude-code/scripts/route-spawn.sh ~/.claude/nadir/
-chmod +x ~/.claude/nadir/route-spawn.sh
+curl -fsSL https://getnadir.com/install/claude-code.sh | sh
 ```
 
-then in `~/.claude/settings.json` (or a project's `.claude/settings.json`):
+For tiering work that is not a subagent spawn (batch items, "which model should
+this use", delegate-vs-inline cost), the full skill documents the whole
+`/v1/bucket` contract: `npx skills add https://getnadir.com`
 
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Agent",
-        "hooks": [{ "type": "command", "command": "$HOME/.claude/nadir/route-spawn.sh" }]
-      }
-    ]
-  }
-}
-```
+## Source
 
-Hooks also fire inside subagents and under `claude -p`, so nested fan-out is
-routed too (unless `--bare`, which skips hook discovery).
-
-## Codex
-
-Same shape: `PreToolUse` on `spawn_agent`, matcher alias `Agent`,
-`hookSpecificOutput.updatedInput`. Two Codex-specific constraints:
-
-1. **Model catalog.** The injected slug is validated against
-   `models_manager.list_models()`; anything outside the catalog is rejected.
-   There is no universal slug to guess, so the script routes through
-   `NADIR_CODEX_LADDER` — a JSON tier→slug map *you* set to match your catalog
-   (`model_catalog_json` is the lever for registering custom slugs). With it
-   unset the hook is a no-op instead of a source of 400s.
-2. **`deny_unknown_fields`.** `spawn_agent` args (`model`, `reasoning_effort`,
-   `service_tier`, `agent_type`, `task_name`, `message`) reject unknown keys, so
-   `updatedInput` echoes exactly the fields that arrived plus `model`. The script
-   never invents a field.
-
-```bash
-mkdir -p ~/.codex/nadir
-cp integrations/agent-hooks/codex/route-spawn.sh ~/.codex/nadir/
-chmod +x ~/.codex/nadir/route-spawn.sh
-cp integrations/agent-hooks/codex/hooks.json ~/.codex/hooks.json   # or merge
-export NADIR_CODEX_LADDER='{"simple":"gpt-5.6-mini","medium":"gpt-5.6","complex":"gpt-5.6-terra"}'
-```
-
-**One-time trust prompt:** non-managed command hooks must be approved once via
-`/hooks` in Codex. Trust is keyed to the script's hash, so editing
-`route-spawn.sh` re-prompts.
-
-The Codex script classifies on `message` (falling back to `task_name`), capped at
-2000 chars, mirroring the Claude Code script's `prompt` → `description`. The task
-text is the classification input; the short label is only a fallback, since a
-2-6 word label buckets far cheaper than the work it names.
-
-## Local test recipe
-
-Pipe a fabricated hook stdin through the script and read stdout.
-
-```bash
-S=integrations/agent-hooks/claude-code/scripts/route-spawn.sh
-
-# normal case -> {"hookSpecificOutput": {... "updatedInput": {... "model": ...}}}
-echo '{"tool_name":"Agent","tool_input":{"prompt":"rename a variable in one file","description":"rename a variable","subagent_type":"Explore","model":"opus"}}' | sh $S
-
-# disabled -> no output
-echo '{"tool_input":{"description":"rename a variable"}}' | NADIR_ROUTE_DISABLE=1 sh $S
-
-# unreachable endpoint -> no output, exit 0
-echo '{"tool_input":{"description":"rename a variable"}}' | NADIR_BUCKET_URL=http://127.0.0.1:9/v1/bucket sh $S; echo "exit=$?"
-
-# garbage stdin -> no output, exit 0
-echo 'not json' | sh $S; echo "exit=$?"
-```
-
-Codex equivalent, with the ladder set:
-
-```bash
-echo '{"tool_name":"spawn_agent","tool_input":{"agent_type":"explorer","task_name":"rename a variable","message":"rename a variable in one file","model":"gpt-5.6"}}' \
-  | NADIR_CODEX_LADDER='{"simple":"gpt-5.6-mini","medium":"gpt-5.6","complex":"gpt-5.6-terra"}' \
-    sh integrations/agent-hooks/codex/route-spawn.sh
-```
-
-Verify afterwards in the agent: Claude Code's `PostToolUse`
-`tool_response.resolvedModel` names the model the subagent actually started on.
+Mirrored from `integrations/agent-hooks/claude-code` in the Nadir monorepo,
+which is the source of truth. Issues: <https://getnadir.com>
