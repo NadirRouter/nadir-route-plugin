@@ -35,8 +35,12 @@ Three rules, all deliberate:
   hook rewrite into a *denied* tool call. Aliases also resolve through your own
   `ANTHROPIC_DEFAULT_*_MODEL` config, so a routed spawn lands in your family and
   your generation rather than one this plugin hardcoded.
-- **It never moves a spawn up.** If the agent already asked for something
-  cheaper than the routed tier, that stands.
+- **It never moves a spawn up on its own.** If the agent already asked for
+  something cheaper than the routed tier, that stands. The one exception is an
+  explicit policy pin from your account, which is a standing instruction from
+  you and so wins in either direction. A pin naming a full model id
+  (`claude-sonnet-5`) cannot be expressed on the alias enum at all, so it falls
+  through to the tier ladder rather than doing nothing.
 
 Your main thread is never touched, by construction: the hook fires only on
 spawns.
@@ -91,7 +95,9 @@ names the model a subagent actually started on.
 ## Precedence traps
 
 - `CLAUDE_CODE_SUBAGENT_MODEL`, if set to anything but `inherit`, outranks the
-  per-invocation model this hook writes — the hook silently does nothing.
+  per-invocation model this hook writes. The hook now detects this and exits
+  before calling the API, so it spends no decision — and books no savings — on a
+  rewrite that is guaranteed to be discarded.
 - The hook does beat a subagent's frontmatter `model`, including `model: inherit`.
 - This is a nudge, not a control. Claude Code's `Agent` permission rules match
   the agent *type*, not the model, so there is no local way to enforce a ceiling.

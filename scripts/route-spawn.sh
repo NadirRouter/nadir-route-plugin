@@ -26,15 +26,33 @@
 # policy governs the decision and it shows up in the dashboard's Engine
 # decisions; an explicit NADIR_AGENT_POLICY still wins over the account policy).
 
-[ "$NADIR_ROUTE_DISABLE" = "1" ] && exit 0
+# Every early exit drains stdin first, so the harness never sees EPIPE on a
+# large tool_input it is still writing.
+[ "$NADIR_ROUTE_DISABLE" = "1" ] && { cat >/dev/null 2>&1; exit 0; }
+
+# CLAUDE_CODE_SUBAGENT_MODEL outranks a hook's rewrite, so anything but
+# `inherit` makes this hook a guaranteed no-op. Bail before spending a decision
+# the spawn will discard -- and, more importantly, before the server prices a
+# saving the dashboard would then report for a model that never changed.
+case "${CLAUDE_CODE_SUBAGENT_MODEL:-inherit}" in
+    inherit) ;;
+    *) cat >/dev/null 2>&1; exit 0 ;;
+esac
 
 hook_input=$(cat)
 
 req=$(printf '%s' "$hook_input" | python3 -c '
 import json, os, sys
 try:
-    ti = json.load(sys.stdin).get("tool_input") or {}
-    prompt = (ti.get("prompt") or ti.get("description") or "")[:2000]
+    hook = json.load(sys.stdin)
+    ti = hook.get("tool_input") or {}
+    # Matchers are regex, so a future broadening of "Agent" could route another
+    # tool through here; writing `model` into an input whose schema forbids it
+    # fails validation, and Claude Code turns a failed rewrite into a denied call.
+    if hook.get("tool_name") not in ("Agent", "Task", None):
+        raise SystemExit
+    # str(): a list/int prompt would otherwise be forwarded as-is (422) or raise.
+    prompt = str(ti.get("prompt") or ti.get("description") or "")[:2000]
 except Exception:
     raise SystemExit
 if not prompt:
@@ -54,6 +72,18 @@ body = {
     "role": "subagent",
     "requested_model": ti.get("model") or os.environ.get("NADIR_BASELINE_MODEL") or "",
 }
+# Declare the tiers this hook can actually apply, so the server prices the rest
+# as no-change. `complex` is deliberately absent (the top tier keeps the session
+# model), and an audit-mode ladder of {"simple":"inherit","medium":"inherit"}
+# now books zero instead of a full savings figure for changing nothing.
+_ladder = {"simple": "haiku", "medium": "sonnet"}
+_raw_ladder = os.environ.get("NADIR_CLAUDE_LADDER", "").strip()
+if _raw_ladder:
+    try:
+        _ladder.update(json.loads(_raw_ladder))
+    except Exception:
+        pass
+body["ladder"] = _ladder
 try:
     body["agent_policy"] = json.loads(os.environ["NADIR_AGENT_POLICY"])
 except Exception:
@@ -89,8 +119,15 @@ LADDER = {"simple": "haiku", "medium": "sonnet"}
 try:
     body = json.load(sys.stdin)
     ti = json.loads(os.environ["NADIR_HOOK_INPUT"]).get("tool_input") or {}
-    tier = (body.get("plan") or {}).get("tier") or body.get("bucket") or ""
-    rr = body.get("role_resolution") or {}
+    # str()/isinstance guards: a 200 whose fields are the wrong JSON type must
+    # fail open like any other bad response. Without them a list `tier` raises
+    # TypeError at the ladder lookup and a string `role_resolution` raises
+    # AttributeError below -- both outside this try, both spraying a traceback.
+    plan = body.get("plan")
+    plan = plan if isinstance(plan, dict) else {}
+    tier = str(plan.get("tier") or body.get("bucket") or "")
+    rr = body.get("role_resolution")
+    rr = rr if isinstance(rr, dict) else {}
 except Exception:
     raise SystemExit
 
@@ -101,24 +138,33 @@ except Exception:
 # rather than emit a value that would deny the spawn.
 if rr.get("decided_by") == "policy":
     pinned = str(rr.get("model") or "").strip().lower()
-    if pinned in RANK and pinned != str(ti.get("model") or "").strip().lower():
-        ti["model"] = pinned
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": ti,
-        }}))
-    raise SystemExit
+    if pinned in RANK:
+        if pinned != str(ti.get("model") or "").strip().lower():
+            ti["model"] = pinned
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": ti,
+            }}))
+        raise SystemExit
+    # A policy naming a full model id cannot be expressed on this enum, so fall
+    # through to the ladder rather than do nothing at all. The shipped Settings
+    # presets use full ids, so terminating here disabled spawn routing outright
+    # for every keyed pilot that picked one.
 
-try:
-    ladder = dict(LADDER)
-    ladder.update(json.loads(os.environ["NADIR_CLAUDE_LADDER"]))
-except KeyError:
-    pass
-except Exception:
-    raise SystemExit  # a malformed ladder is not a licence to guess
+ladder = dict(LADDER)
+# `export NADIR_CLAUDE_LADDER=` is how a profile usually clears a var, and it is
+# not a KeyError -- json.loads("") raises, which used to kill the whole hook.
+_raw_ladder = os.environ.get("NADIR_CLAUDE_LADDER", "").strip()
+if _raw_ladder:
+    try:
+        ladder.update(json.loads(_raw_ladder))
+    except Exception:
+        raise SystemExit  # a malformed ladder is not a licence to guess
 
-alias = ladder.get(tier)
+# Lowercased so a ladder written {"simple":"HAIKU"} routes instead of silently
+# no-opping; the requested-model check below is already case-insensitive.
+alias = str(ladder.get(tier) or "").strip().lower()
 if alias not in RANK:
     # Unmapped tier ("complex"), "inherit", or a value the tool would reject.
     raise SystemExit

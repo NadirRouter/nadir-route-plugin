@@ -1,5 +1,5 @@
 {
   "name": "nadir-route",
   "description": "Right-size every subagent spawn: a PreToolUse hook asks Nadir's free decision API which model the task needs and rewrites the spawn's model, using your harness's own aliases so the pick stays in your model family and generation. Complex spawns and your main thread are never touched. Fail-open: any error and the spawn proceeds exactly as the agent intended.",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

@@ -23,7 +23,10 @@ maps that onto the `Agent` tool's model aliases:
 `complex` is deliberately left alone: the top tier stays on the model the user
 chose, including which Opus generation. The hook also never moves a spawn *up* —
 if the agent already asked for something cheaper than the routed tier, that
-stands. If you are asked what a specific spawn cost or saved, the per-decision
+stands. The one exception is an explicit policy pin, which is a standing
+instruction from you and so wins in either direction; a pin naming a full model
+id cannot be expressed on the alias enum, so it falls through to the tier ladder
+rather than doing nothing. If you are asked what a specific spawn cost or saved, the per-decision
 log is on the dashboard at **/dashboard/agents → Engine decisions**, which shows
 the bucket, the confidence, the model swap and which rules fired.
 
@@ -31,8 +34,10 @@ the bucket, the confidence, the model swap and which rules fired.
   spawn proceeds untouched. It is a nudge, not a gate.
 - `NADIR_ROUTE_DISABLE=1` turns the hook off. `NADIR_CLAUDE_LADDER` retunes the
   table above (`{"simple":"inherit","medium":"inherit"}` = record decisions,
-  change nothing). `NADIR_AGENT_POLICY` (raw JSON, default `{"subagent":"auto"}`)
-  pins a role instead of letting the router pick.
+  change nothing). `NADIR_AGENT_POLICY` (raw JSON)
+  pins a role instead of letting the router pick. Without it a keyless install
+  defaults to `{"subagent":"auto"}`, while a keyed one uses the policy saved on
+  your account.
 - `NADIR_BASELINE_MODEL` tells Nadir which model the session runs, which is what
   the savings figure is computed against. Without it decisions log unpriced.
 - `CLAUDE_CODE_SUBAGENT_MODEL` outranks the hook: if it is set to anything other
