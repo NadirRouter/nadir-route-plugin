@@ -11,8 +11,9 @@ spawn's input. Your main thread stays on the model you chose.
 
 ## What it actually does, so you can answer "why did that run on Haiku"
 
-Nadir buckets the spawn's prompt as `simple`, `medium`, or `complex`, and the hook
-maps that onto the `Agent` tool's model aliases:
+Nadir buckets the spawn's prompt and returns `selected_model`. The hook uses
+that final choice when it is an accepted alias; null or an unrepresentable ID
+leaves the spawn untouched. The default ladder is:
 
 | bucket | hook writes | effect |
 |---|---|---|
@@ -25,8 +26,9 @@ chose, including which Opus generation. The hook also never moves a spawn *up* â
 if the agent already asked for something cheaper than the routed tier, that
 stands. The one exception is an explicit policy pin, which is a standing
 instruction from you and so wins in either direction; a pin naming a full model
-id cannot be expressed on the alias enum, so it falls through to the tier ladder
-rather than doing nothing. If you are asked what a specific spawn cost or saved, the per-decision
+id cannot be expressed on the alias enum, so a modern response leaves the spawn
+unchanged. Tier fallback applies only to older responses without `selected_model`.
+If you are asked what a specific spawn cost or saved, the per-decision
 log is on the dashboard at **/dashboard/agents â†’ Engine decisions**, which shows
 the bucket, the confidence, the model swap and which rules fired.
 
@@ -54,5 +56,15 @@ the full skill, which documents the whole `/v1/bucket` contract:
 ```
 npx skills add https://getnadir.com
 ```
+
+For coding work, keep handoffs concise and include the objective, file ownership,
+constraints, exact failures and acceptance check. Reuse existing code before
+adding it, at every tier. Inspect the diff and run the relevant check before
+calling a cheap-model task complete; restore missing context before escalating.
+The full skill also bundles `scripts/compact_context.py` and
+`references/coding.md` for local, recoverable tool-output previews. Install it
+with the command above when compaction is needed. The helper makes no model
+call and cannot rewrite the host's existing conversation. With this hook active,
+skip only the full skill's classification call, not its coding guidance.
 
 Reference: <https://getnadir.com/.well-known/agent-skills/nadir-route/SKILL.md>
