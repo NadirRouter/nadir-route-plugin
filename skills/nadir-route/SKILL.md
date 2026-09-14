@@ -9,6 +9,12 @@ This plugin routes **spawns only**. Its `PreToolUse` hook on the `Agent` tool as
 Nadir's decision API which model the task needs and rewrites `model` in the
 spawn's input. Your main thread stays on the model you chose.
 
+For Superpowers sessions, use the full skill's `references/superpowers.md`
+active companion and set `NADIR_ROUTE_DISABLE=1` in the host session. Execute
+the companion's returned `tool_input` for every dispatch. This hook
+cannot read referenced task files. Do not let it reclassify a file-path wrapper,
+cancel an independent review or downgrade a protected fix/escalation stage.
+
 ## What it actually does, so you can answer "why did that run on Haiku"
 
 Nadir buckets the spawn's prompt and returns `selected_model`. The hook uses

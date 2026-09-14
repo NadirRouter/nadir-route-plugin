@@ -27,29 +27,10 @@
 # prefix is not the task, and a wrong cheap pick costs far more than a missed
 # saving, so the limit is a decision boundary rather than a buffer.
 #
-# Correctness rests on the SERVER, not on a character count. /v1/bucket runs
-# whatever COMPLEXITY_ANALYZER_TYPE names, and that default is `wide_deep_asym`
-# (backend/app/settings.py), which encodes with BAAI/bge-base-en-v1.5 at
-# max_seq_length 512. Only the server holds that tokenizer, so only the server
-# can say whether a decision was made from a prefix: it answers with
-# `input_truncated` (and `encoder_tokens`, the real tokenized length), and a
-# true there makes this hook discard the decision and emit nothing. No
-# client-side constant can do that job, because characters are not tokens.
-#
-# NADIR_MAX_PROMPT_CHARS is a cheap PRE-FILTER on top of that, default 1362, and
-# nothing more: it saves a round trip on an input that is PROBABLY too long.
-# 1362 is 512 tokens at 2.66 chars/token, the WORST ratio measured over the
-# frozen coding-agent task corpus through the real BGE tokenizer (median 3.58).
-# It errs in BOTH directions and neither is a correctness problem:
-#   - too eager: measured on that corpus, 2 of 12 prompts it rejects actually fit
-#     (sqlparse__per_call_lexer 2007 chars / 511 tokens, and
-#     textdistance__lcsstr_long_input_cost 1993 / 469). Those spawns keep their
-#     model and the saving is lost. Raise the var to trade round trips for them.
-#   - too lax: code-dense text (diffs, stack traces, file listings) reaches
-#     2.1 chars/token, where 1362 characters is already 649 tokens and past the
-#     window. The server catches those with `input_truncated`.
-# Raising it does not widen the encoder, it only hands more inputs to the server,
-# which then reports `input_truncated` and this hook abstains anyway.
+# Only the server tokenizer can verify that the classifier saw the whole
+# input. Automatic changes require input_truncated=false and encoder_tokens>0.
+# NADIR_MAX_PROMPT_CHARS (default 1362) is only a round-trip prefilter; raising
+# it does not widen the classifier window or bypass the server coverage check.
 #
 # Abstention is the same fail-open shape as every other failure path here: exit
 # 0 with no stdout, and the spawn keeps whatever model it already had.
@@ -58,6 +39,10 @@
 # NADIR_TURNS_BY_TYPE (JSON subagent_type -> expected turns; generate it from your
 # own transcripts with `backend/measure_agent_turns.py --json`, never borrow one),
 # NADIR_EXPECTED_TURNS (flat fallback for types absent from that map),
+# NADIR_SPAWN_CACHED_TOKENS (size of the prompt-cache prefix a spawn on the
+# baseline model actually shares; absent means unknown, explicit 0 means cold),
+# NADIR_CACHE_TTL (5m|1h, default 5m), NADIR_CURRENT_INPUT_TOKENS,
+# NADIR_CACHE_AGE_SECONDS (age at request start; refresh each call),
 # CLAUDE_EFFORT (set by the harness, not by you: the session's effort level,
 # forwarded as baseline_effort so the top tier is never told to think less),
 # NADIR_CLAUDE_LADDER (tier->alias JSON; a tier mapped to "inherit" or omitted
@@ -80,15 +65,82 @@ esac
 
 hook_input=$(cat)
 
-req=$(printf '%s' "$hook_input" | python3 -c '
+# The baseline is the model THIS session runs, and the session states it.
+#
+# Claude Code fills tool_input.model only when a spawn names one explicitly, so
+# an inherited spawn arrives with no model at all. That leaves the decision
+# unpriced (the dashboard reads "N decisions, $0.00") and leaves the ladder with
+# nothing to compare against, which is why NADIR_BASELINE_MODEL existed: a
+# hand-set env var that goes stale the moment the user switches model.
+#
+# It does not have to be hand-set. The harness passes transcript_path on every
+# hook event, and the last main-thread assistant turn in that file carries the
+# real API id. Read it once here and export it, so both python blocks below keep
+# reading NADIR_BASELINE_MODEL exactly as before and an explicit value still
+# wins. ONLY the model id is read; message text is never parsed.
+#
+# Sidechain turns are skipped deliberately: they are subagents, and a previous
+# Haiku subagent must not be mistaken for the session baseline, which would make
+# the hook believe it is already at the cheap tier and stop routing entirely.
+if [ -z "$NADIR_BASELINE_MODEL" ]; then
+    NADIR_BASELINE_MODEL=$(printf '%s' "$hook_input" | python3 -c '
 import json, os, sys
+from pathlib import Path
 
-# The deployed analyzer (wide_deep_asym) encodes with bge-base-en-v1.5 at 512
-# tokens and stops. 1362 characters is that window at 2.66 chars/token, the
-# worst ratio measured on the frozen coding-agent corpus. A PRE-FILTER to save
-# a round trip, never the correctness check -- `input_truncated` on the
-# response is, because only the server holds the tokenizer. It over-rejects:
-# 2 of the 12 frozen prompts it stops (511 and 469 tokens) would have fit.
+ALIASES = ("haiku", "sonnet", "opus", "fable")
+try:
+    hook = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+path = str((hook or {}).get("transcript_path") or "")
+if not path:
+    # Older harness builds omit the field. The session id names the same file,
+    # and globbing it avoids reimplementing the project-directory slug.
+    session = str(os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
+    if not session or "/" in session or "\\" in session or session in (".", ".."):
+        raise SystemExit
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")) / "projects"
+    try:
+        found = sorted(root.glob("*/" + session + ".jsonl"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        raise SystemExit
+    if not found:
+        raise SystemExit
+    path = str(found[0])
+try:
+    # Tail only: these files reach tens of megabytes and the answer is at the
+    # end. A turn split by the boundary fails to parse and the next one back is
+    # used, which is why this walks backwards rather than taking the first hit.
+    with open(path, "rb") as stream:
+        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 262144))
+        raw = stream.read()
+except OSError:
+    raise SystemExit
+for line in reversed(raw.split(b"\n")):
+    if b"assistant" not in line:
+        continue
+    try:
+        entry = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain"):
+        continue
+    message = entry.get("message")
+    model = (message or {}).get("model") if isinstance(message, dict) else None
+    # An alias here would buy a pricing_unknown plan, which is worse than
+    # sending nothing, so it is dropped the same way a hand-set one is.
+    if isinstance(model, str) and model and model.lower() not in ALIASES:
+        print(model)
+        break
+' 2>/dev/null) || NADIR_BASELINE_MODEL=""
+    export NADIR_BASELINE_MODEL
+fi
+
+req=$(printf '%s' "$hook_input" | python3 -c '
+import json, math, os, sys
+
+# Round-trip prefilter only; the server coverage check is authoritative.
 MAX_PROMPT_CHARS = 1362
 
 try:
@@ -197,22 +249,25 @@ try:
     _turns = int(_turns)
 except (TypeError, ValueError):
     _turns = None
+# The warm model, resolved once: `context.warm_model` and the `cache` block
+# below are the same claim about the same model, so they share one guard.
+#
+# NADIR_BASELINE_MODEL only, and never ti["model"]: that field is the Agent
+# tool ENUM (haiku|sonnet|opus|fable), and a bare alias has no price entry, so
+# passing one buys a `pricing_unknown` plan that defaults to `delegate` without
+# costing anything -- strictly worse than sending nothing at all. Aliases are
+# filtered here too, in case a baseline was set to one by hand.
+_warm = (os.environ.get("NADIR_BASELINE_MODEL") or "").strip()
+if _warm.lower() in ("haiku", "sonnet", "opus", "fable"):
+    _warm = ""
 ctx = {}
 if _turns and _turns > 0:
     # `warm_model` has to ride along or the horizon prices nothing: with no
     # inline alternative the plan reports `no_warm_model` and never runs the
     # cost comparison the turn count exists to feed. Same value already sent as
     # `requested_model`, so it cannot move the advisory saving.
-    #
-    # NADIR_BASELINE_MODEL only, and never ti["model"]: that field is the Agent
-    # tool ENUM (haiku|sonnet|opus|fable), and a bare alias has no price entry,
-    # so passing one as warm_model buys a `pricing_unknown` plan that defaults to
-    # `delegate` without costing anything -- strictly worse than sending no
-    # context at all. Aliases are filtered here too, in case a baseline was set
-    # to one by hand.
     ctx["expected_turns"] = min(_turns, 100)
-    _warm = (os.environ.get("NADIR_BASELINE_MODEL") or "").strip()
-    if _warm and _warm.lower() not in ("haiku", "sonnet", "opus", "fable"):
+    if _warm:
         ctx["warm_model"] = _warm
 
 # Effort. The harness states its own, so nobody has to guess it: `baseline_effort`
@@ -241,6 +296,37 @@ if isinstance(_effort, str) and _effort.strip().lower() in (
 
 if ctx:
     body["context"] = ctx
+
+# Unknown cache is no block, never a fabricated zero or an omitted token
+# count inside a block (the API assumes that means fully cached). Measurements
+# must describe this spawn on the baseline model, not another model/session.
+_current = str(ti.get("model") or _warm).strip()
+_same_model = _current == _warm or (
+    _current in ("haiku", "sonnet", "opus", "fable")
+    and _warm.startswith("claude-" + _current + "-"))
+if _warm and _same_model:
+    try:
+        _cached = int(os.environ["NADIR_SPAWN_CACHED_TOKENS"])
+        _ttl = (os.environ.get("NADIR_CACHE_TTL") or "5m").strip().lower()
+        if not 0 <= _cached <= 1000000 or _ttl not in ("5m", "1h"):
+            raise ValueError("invalid cache state")
+        _cache = {"model": _warm, "cached_tokens": _cached, "ttl": _ttl}
+        for _env, _field, _parse, _ceiling in (
+            ("NADIR_CURRENT_INPUT_TOKENS", "current_input_tokens", int, 1000000),
+            ("NADIR_CACHE_AGE_SECONDS", "seconds_since_last_request", float, 86400),
+        ):
+            if os.environ.get(_env):
+                _value = _parse(os.environ[_env])
+                if not math.isfinite(_value) or not 0 <= _value <= _ceiling:
+                    raise ValueError("invalid cache measurement")
+                _cache[_field] = _value
+        if _cached > _cache.get("current_input_tokens", 1000000):
+            raise ValueError("cached prefix exceeds input")
+        if _turns and _turns > 0:
+            _cache["expected_remaining_turns"] = min(_turns, 100)
+        body["cache"] = _cache
+    except (KeyError, TypeError, ValueError, OverflowError):
+        pass  # Unusable measurements stay unknown; the routing call still runs.
 # Declare the tiers this hook can actually apply, so the server prices the rest
 # as no-change. `complex` is deliberately absent (the top tier keeps the session
 # model), and an audit-mode ladder of {"simple":"inherit","medium":"inherit"}
@@ -257,11 +343,11 @@ if _raw_ladder:
 _aliases = ("haiku", "sonnet", "opus", "fable")
 _current = str(ti.get("model") or os.environ.get("NADIR_BASELINE_MODEL") or "").strip().lower()
 _current_alias = next((a for a in _aliases if _current == a or _current.startswith("claude-" + a + "-")), None)
-if _current_alias:
-    for _tier, _model in _ladder.items():
-        _alias = str(_model).strip().lower()
-        if _alias in _aliases and _aliases.index(_alias) >= _aliases.index(_current_alias):
-            _ladder[_tier] = "inherit"
+for _tier, _model in _ladder.items():
+    _alias = str(_model).strip().lower()
+    if (_current_alias is None or
+            (_alias in _aliases and _aliases.index(_alias) >= _aliases.index(_current_alias))):
+        _ladder[_tier] = "inherit"
 body["ladder"] = _ladder
 try:
     body["agent_policy"] = json.loads(os.environ["NADIR_AGENT_POLICY"])
@@ -314,29 +400,21 @@ try:
     tier = str(body.get("routing_tier") or plan.get("tier") or body.get("bucket") or "")
     rr = body.get("role_resolution")
     rr = rr if isinstance(rr, dict) else {}
+    # Same isinstance discipline: a 200 whose cache_advice is a string, a list
+    # or null must fail open and route normally, not raise on the .get() below.
+    adv = body.get("cache_advice")
+    adv = adv if isinstance(adv, dict) else {}
 except Exception:
     raise SystemExit
 
-# THE correctness check. The server owns the tokenizer, so it is the only party
-# that knows whether the decision was made from a prefix: `input_truncated` says
-# it was, and a tier chosen from the opening of a task is not a tier for the
-# task. Discard it and let the spawn keep its model. The character pre-filter
-# upstream is only a proxy for this -- at 2.1 chars/token a prompt that passed
-# it is still 649 tokens against a 512-token window -- so the guarantee lives
-# here, not there. Truthy rather than `is True`: a strange value fails toward
-# abstention, which is the cheap direction. An absent field is an older backend
-# that does not report truncation, and abstaining on every one of those calls
-# would disable the hook against every deployment but the newest.
-if body.get("input_truncated"):
-    raise SystemExit
-
 # An explicit policy pin is a standing instruction from the user, so it wins
-# over the tier ladder — including on complex, and including an up-move. It is
-# still held to the enum: a policy naming a full model id ("claude-haiku-4-5")
-# cannot be expressed on this surface at all, so fall through to the ladder
-# rather than emit a value that would deny the spawn.
-if "selected_model" not in body and rr.get("decided_by") == "policy":
-    pinned = str(rr.get("model") or "").strip().lower()
+# over truncation and cache advice too: those qualify an automatic decision,
+# while the pin is independent of the classifier input. Modern responses put
+# the final pin in selected_model; legacy ones carry it only in role_resolution.
+# It is still held to the enum: a full model id cannot be expressed here.
+if rr.get("decided_by") == "policy":
+    pinned = str(body.get("selected_model") if "selected_model" in body
+                 else rr.get("model") or "").strip().lower()
     if pinned in RANK:
         if pinned != str(ti.get("model") or "").strip().lower():
             ti["model"] = pinned
@@ -350,6 +428,28 @@ if "selected_model" not in body and rr.get("decided_by") == "policy":
     # through to the ladder rather than do nothing at all. The shipped Settings
     # presets use full ids, so terminating here disabled spawn routing outright
     # for every keyed pilot that picked one.
+
+# THE correctness check for automatic routing. The server owns the tokenizer,
+# so it is the only party that knows whether the decision was made from a
+# prefix. Missing/unknown coverage is not permission to change models.
+tokens = body.get("encoder_tokens")
+if body.get("input_truncated") is not False or type(tokens) is not int or tokens <= 0:
+    raise SystemExit
+
+# The cache verdict, and only `stay_warm`: every other decision (no_conflict,
+# no_warm_cache, cache_expired, insufficient_data) leaves the router pick
+# standing by definition. cache_advice is ADVISORY on /v1/bucket -- the server
+# computes and logs it, but selected_model is decided independently of it and is
+# never moved by it -- so honouring the verdict is the job of THIS hook. Do not
+# carry that assumption to /v1/recommend, which applies it server-side.
+#
+# BELOW the policy pin on purpose. A pin is a standing instruction from the
+# user, and this file already lets it beat the tier ladder including an up-move;
+# a cache verdict is a cost estimate, and a cost estimate does not get to
+# overrule what the user asked for. Above the ladder, which is the only thing it
+# may veto.
+if adv.get("decision") == "stay_warm":
+    raise SystemExit
 
 ladder = dict(LADDER)
 # `export NADIR_CLAUDE_LADDER=` is how a profile usually clears a var, and it is
@@ -380,10 +480,9 @@ if current == alias:
     raise SystemExit
 if current in RANK and RANK[current] <= RANK[alias] and not pinned:
     raise SystemExit  # already at or below the routed tier
-if current and current not in RANK and not pinned:
-    # The agent asked for something this hook cannot rank (a full model id, or
-    # a value from a newer harness). Leave it: replacing it could easily be an
-    # upgrade, and guessing its rank is how a cost hook starts costing money.
+if current not in RANK and not pinned:
+    # Unknown inherited baselines and unrankable explicit models both stay:
+    # without their tier, a replacement could increase cost.
     raise SystemExit
 
 ti["model"] = alias  # updatedInput REPLACES tool_input, so echo every field
