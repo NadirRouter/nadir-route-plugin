@@ -1,4 +1,5 @@
 {
+  "_comment": "Two routes, one install. Agent events carry the BUCKET route: route-spawn.sh asks /v1/bucket which tier a spawn needs, report-outcome.sh reports what happened. The Read/Bash/SessionStart events carry COMPACTION, which is local: context_session.py makes no API and no model call, shrinking bulky tool output and large file reads before they reach the context window, with an exact archive and SHA-256 so the original is always recoverable. --no-policy is deliberate: the installer's default pins a behaviour policy at session start, and a plugin must not silently compete with Ponytail or whatever the user already runs. Anyone who wants it can run scripts/context_session.py --install-project with --policy-file instead.",
   "hooks": {
     "PreToolUse": [
       {
@@ -7,6 +8,16 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}\"/scripts/route-spawn.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/context_session.py --state-dir \"$HOME\"/.nadir/context --max-chars 8000 --no-policy",
+            "timeout": 5
           }
         ]
       }
@@ -18,6 +29,40 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}\"/scripts/report-outcome.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/context_session.py --state-dir \"$HOME\"/.nadir/context --max-chars 8000 --no-policy",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/context_session.py --state-dir \"$HOME\"/.nadir/context --max-chars 8000 --no-policy",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/context_session.py --state-dir \"$HOME\"/.nadir/context --max-chars 8000 --no-policy",
+            "timeout": 5
           }
         ]
       }

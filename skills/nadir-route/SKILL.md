@@ -67,10 +67,14 @@ For coding work, keep handoffs concise and include the objective, file ownership
 constraints, exact failures and acceptance check. Reuse existing code before
 adding it, at every tier. Inspect the diff and run the relevant check before
 calling a cheap-model task complete; restore missing context before escalating.
-The full skill also bundles `scripts/compact_context.py` and
-`references/coding.md` for local, recoverable tool-output previews. Install it
-with the command above when compaction is needed. The helper makes no model
-call and cannot rewrite the host's existing conversation. With this hook active,
-skip only the full skill's classification call, not its coding guidance.
+Compaction is already running: this plugin registers the same hooks on
+SessionStart, SubagentStart, Read and Bash, so bulky tool output and large file
+reads are shrunk to a recoverable view with an exact archive and SHA-256 before
+they reach the context window. It makes no model call, no API call, and cannot
+rewrite the host's existing conversation, and it installs with no behaviour
+policy so it does not compete with one you already run. Do not invoke
+`scripts/compact_context.py` by hand for output the hooks already handled; use
+it for a file you captured yourself. With this hook active, skip only the full
+skill's classification call, not its coding guidance.
 
 Reference: <https://getnadir.com/.well-known/agent-skills/nadir-route/SKILL.md>
