@@ -137,9 +137,11 @@ def install(project, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000):
     command = [sys.executable, str(Path(__file__).resolve()), "--state-dir", str(state_dir),
                "--max-chars", str(max_chars)]
     command += ["--policy-file", str(policy_file)] if policy_file is not None else ["--no-policy"]
-    for event, matcher in (("SessionStart", "startup|clear|resume|compact"),
-                           ("SubagentStart", ".*"), ("PreToolUse", "Read"),
-                           ("PostToolUse", "Read|Bash")):
+    nudge = [sys.executable, str(Path(__file__).resolve().with_name("cache_miss_nudge.py")),
+             "--state-dir", str(state_dir)]
+    for event, matcher, argv in (("SessionStart", "startup|clear|resume|compact", command),
+                                 ("SubagentStart", ".*", command), ("PreToolUse", "Read", command),
+                                 ("PostToolUse", "Read|Bash", command), ("Stop", None, nudge)):
         entries = hooks.get(event, [])
         if not isinstance(entries, list):
             raise ValueError(f"hooks.{event} must be an array")
@@ -150,8 +152,10 @@ def install(project, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000):
             other = [hook for hook in entry["hooks"] if not isinstance(hook, dict) or hook.get("statusMessage") != HOOK_LABEL]
             if other:
                 preserved.append(dict(entry, hooks=other))
-        preserved.append({"matcher": matcher, "hooks": [{"type": "command", "command": shlex.join(command),
-                                                           "timeout": 5, "statusMessage": HOOK_LABEL}]})
+        entry = {"hooks": [{"type": "command", "command": shlex.join(argv), "timeout": 5, "statusMessage": HOOK_LABEL}]}
+        if matcher is not None:  # Stop takes no matcher
+            entry = {"matcher": matcher, **entry}
+        preserved.append(entry)
         hooks[event] = preserved
     settings.parent.mkdir(mode=0o700, exist_ok=True)
     if (settings.read_bytes() if settings.exists() else None) != original:

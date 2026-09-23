@@ -38,8 +38,9 @@ If you are asked what a specific spawn cost or saved, the per-decision
 log is on the dashboard at **/dashboard/agents → Engine decisions**, which shows
 the bucket, the confidence, the model swap and which rules fired.
 
-- Any failure (network, timeout, non-200, bad JSON) produces no output and the
-  spawn proceeds untouched. It is a nudge, not a gate.
+- Network, timeout, ordinary non-200, and bad JSON responses leave the spawn
+  untouched. A `model_not_allowed` 403 blocks it, and an unrepresentable
+  required governance replacement also blocks it.
 - `NADIR_ROUTE_DISABLE=1` turns the hook off. `NADIR_CLAUDE_LADDER` retunes the
   table above (`{"simple":"inherit","medium":"inherit"}` = record decisions,
   change nothing). `NADIR_AGENT_POLICY` (raw JSON)
@@ -74,7 +75,12 @@ they reach the context window. It makes no model call, no API call, and cannot
 rewrite the host's existing conversation, and it installs with no behaviour
 policy so it does not compete with one you already run. Do not invoke
 `scripts/compact_context.py` by hand for output the hooks already handled; use
-it for a file you captured yourself. With this hook active, skip only the full
+it for a file you captured yourself. A Stop hook also watches the prompt cache: when a turn re-writes the cached
+prefix it tells the user how many tokens were re-cached and why (an idle gap
+past the TTL, a model switch, or a mid-session effort, thinking or tool change),
+and on an idle-gap miss over a large context it suggests `/compact`, because
+nothing in Claude Code lets a hook start compaction. It reads only usage counts,
+never message text, and `NADIR_CONTEXT_DISABLE=1` silences it too. With this hook active, skip only the full
 skill's classification call, not its coding guidance.
 
 Reference: <https://getnadir.com/.well-known/agent-skills/nadir-route/SKILL.md>

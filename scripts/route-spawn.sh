@@ -12,13 +12,10 @@
 # `complex` is never rewritten: the top tier stays on the model the session is
 # already running, whichever Opus (or Fable) that is.
 #
-# Fail-open by construction: every failure path exits 0 with NO stdout, which
-# Claude Code reads as "no decision" and the spawn proceeds untouched.
-# NADIR_TIMEOUT defaults to 5s, not 2s: measured against prod, a 10-way parallel
-# spawn fan-out takes 1.87-2.28s per call (one shared 1-vCPU worker serializes
-# the classifier), so a 2s cap silently lost 9 of 10 decisions in a fan-out —
-# exactly the traffic shape this hook exists for. A spawn that will run for
-# minutes can afford the wait; losing its decision costs the whole measurement.
+# Transport and malformed-response failures leave the spawn untouched. A
+# model-policy denial from the server blocks it.
+# NADIR_TIMEOUT defaults to 5s. Fan-out and longer inputs can take much longer
+# than a short isolated decision; a shorter cap can lose routing decisions.
 #
 # An oversized routing input ABSTAINS; it is never truncated. This hook used to
 # clip the prompt at 2000 characters and classify the prefix, so a task whose
@@ -29,8 +26,9 @@
 #
 # Only the server tokenizer can verify that the classifier saw the whole
 # input. Automatic changes require input_truncated=false and encoder_tokens>0.
-# NADIR_MAX_PROMPT_CHARS (default 1362) is only a round-trip prefilter; raising
-# it does not widen the classifier window or bypass the server coverage check.
+# NADIR_MAX_PROMPT_CHARS (default 1362) is only a round-trip prefilter; it is
+# not derived from the currently serving analyzer. Raising it does not widen
+# that analyzer's window or bypass the server coverage check.
 #
 # Abstention is the same fail-open shape as every other failure path here: exit
 # 0 with no stdout, and the spawn keeps whatever model it already had.
@@ -282,6 +280,95 @@ if _turns and _turns > 0:
 # ("after any silent downgrade for the selected model"). CLAUDE_EFFORT is the
 # same value exposed to hook commands as an env var. Absent means the session
 # model takes no effort parameter, which is exactly when nothing should be sent.
+# Struggle counters for the PARENT thread, read from the transcript the harness
+# names in `transcript_path`. This is the only place the signal is reachable: a
+# PostToolUse tool_response carries no error field (120 sampled locally showed
+# only completed/async_launched), but the transcript carries `is_error` on
+# tool_result blocks, which is exactly what the proxy tier already scans.
+#
+# Content-free by construction -- four ints, never a tool name, an id, or any
+# message text -- so the payload is safe under any store_prompts setting. It
+# mirrors backend/app/services/agent_roles.py:scan_struggle; the thresholds live
+# server-side in struggle_reason and are deliberately NOT duplicated here.
+#
+# Measured on 813 real spawns: fires on 1.35%, all tool_churn. Rare on purpose.
+# It only ever SUSPENDS a downgrade, so a false negative costs nothing beyond
+# current behaviour and a false positive costs one un-downgraded spawn.
+def _struggle(path):
+    # Tail read, never the whole file: transcripts reach 26.8 MB here, which is
+    # 57ms to read whole against 0.3ms for the last 256KB, inside a hook whose
+    # whole budget is seconds and whose failure mode is losing the decision.
+    # A tail holding fewer messages than the window under-counts, which
+    # fails toward "not struggling" -- i.e. toward current behaviour.
+    with open(path, "rb") as fh:
+        fh.seek(0, 2)
+        size = fh.tell()
+        fh.seek(max(0, size - 262144))
+        chunk = fh.read()
+    if size > 262144:
+        chunk = chunk.split(b"\n", 1)[-1]  # drop the partial first line
+    window = []
+    for raw in chunk.splitlines():
+        try:
+            rec = json.loads(raw)
+        except Exception:
+            continue
+        if rec.get("type") not in ("user", "assistant"):
+            continue
+        # Sidechain records are a SUBAGENT struggling, not this thread. Counting
+        # them would let one failing child suspend downgrades for its parent.
+        if rec.get("isSidechain"):
+            continue
+        window.append(rec)
+    window = window[-20:]
+    names, per_tool = {}, {}
+    err = run = longest = tot = 0
+    saw = False
+    for rec in window:
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use":
+                saw = True
+                names[b.get("id")] = b.get("name")
+            elif b.get("type") == "tool_result":
+                saw = True
+                tot += 1
+                if b.get("is_error"):
+                    err += 1
+                    run += 1
+                    if run > longest:
+                        longest = run
+                    n = names.get(b.get("tool_use_id"))
+                    if n:
+                        per_tool[n] = per_tool.get(n, 0) + 1
+                else:
+                    run = 0
+    if not saw:
+        # No tool blocks in the window: a statement about the window SHAPE, not
+        # a measurement. Absent, never zeros -- zeros read downstream as
+        # "measured, and this thread was fine".
+        return None
+    return {
+        "err": err,
+        "run": longest,
+        "rep": max(per_tool.values()) if per_tool else 0,
+        "tot": tot,
+    }
+
+
+_tp = hook.get("transcript_path")
+if isinstance(_tp, str) and _tp:
+    try:
+        _s = _struggle(_tp)
+    except Exception:
+        _s = None  # unreadable, truncated, moved: never lose the decision over it
+    if _s:
+        body["struggle"] = _s
+
 _effort = hook.get("effort")
 if isinstance(_effort, dict):
     _effort = _effort.get("level")
@@ -368,14 +455,15 @@ case "$req" in
 esac
 
 if [ -n "$NADIR_API_KEY" ]; then
-    resp=$(printf '%s' "$req" | curl -s -f -m "${NADIR_TIMEOUT:-5}" -X POST \
+    resp=$(printf '%s' "$req" | curl -s -m "${NADIR_TIMEOUT:-5}" -X POST \
         "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
         -H 'Content-Type: application/json' -H "X-API-Key: $NADIR_API_KEY" \
-        --data-binary @-) || exit 0
+        --data-binary @- -w '\nNADIR_HTTP_STATUS:%{http_code}') || exit 0
 else
-    resp=$(printf '%s' "$req" | curl -s -f -m "${NADIR_TIMEOUT:-5}" -X POST \
+    resp=$(printf '%s' "$req" | curl -s -m "${NADIR_TIMEOUT:-5}" -X POST \
         "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
-        -H 'Content-Type: application/json' --data-binary @-) || exit 0
+        -H 'Content-Type: application/json' --data-binary @- \
+        -w '\nNADIR_HTTP_STATUS:%{http_code}') || exit 0
 fi
 
 printf '%s' "$resp" | NADIR_HOOK_INPUT="$hook_input" python3 -c '
@@ -389,7 +477,18 @@ RANK = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3}
 LADDER = {"simple": "haiku", "medium": "sonnet"}
 
 try:
-    body = json.load(sys.stdin)
+    payload, _, status = sys.stdin.read().rpartition("\nNADIR_HTTP_STATUS:")
+    if status == "403":
+        detail = json.loads(payload).get("detail")
+        if isinstance(detail, dict) and detail.get("error") == "model_not_allowed":
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": "Nadir organization model policy denied this spawn.",
+            }}))
+        raise SystemExit
+    if status != "200":
+        raise SystemExit
+    body = json.loads(payload)
     ti = json.loads(os.environ["NADIR_HOOK_INPUT"]).get("tool_input") or {}
     # str()/isinstance guards: a 200 whose fields are the wrong JSON type must
     # fail open like any other bad response. Without them a list `tier` raises
@@ -405,6 +504,42 @@ try:
     adv = body.get("cache_advice")
     adv = adv if isinstance(adv, dict) else {}
 except Exception:
+    raise SystemExit
+
+governed = body.get("governance_model")
+if governed is not None:
+    # A denied requested model must be replaced even when classifier coverage
+    # is unknown. The Agent tool only accepts aliases. Verify the exact model
+    # behind an alias before applying a governed full ID.
+    target = (body.get("selected_model") if "selected_model" in body
+              else rr.get("model")) if rr.get("decided_by") == "policy" else governed
+    alias = str(target).strip().lower()
+    if alias not in RANK:
+        alias = next((name for name in RANK
+                      if os.environ.get("ANTHROPIC_DEFAULT_" + name.upper() + "_MODEL") == target), "")
+    if alias and alias != str(ti.get("model") or "").strip().lower():
+        ti["model"] = alias
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "allow",
+            "updatedInput": ti,
+        }}))
+    else:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": "Nadir cannot apply the required organization model replacement.",
+        }}))
+    raise SystemExit
+
+# A suspended escalation outranks EVERYTHING below, including the ladder.
+#
+# This is the half that makes `struggle` mean anything. The server answers a
+# struggling thread by handing back the model the caller named, and stamping
+# `escalation: "suspended:<reason>"`, but it does that inside `role_resolution`
+# and it flips `decided_by` to "passthrough" — which is not the policy branch,
+# so control would fall straight through to the tier ladder and downgrade the
+# spawn anyway. Sending the counters without this check is inert: the server
+# would suspend the downgrade and the hook would re-apply it one line later.
+if str(rr.get("escalation") or "").startswith("suspended:"):
     raise SystemExit
 
 # An explicit policy pin is a standing instruction from the user, so it wins

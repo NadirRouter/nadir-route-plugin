@@ -1,5 +1,5 @@
 {
-  "_comment": "Two routes, one install. Agent events carry the BUCKET route: route-spawn.sh asks /v1/bucket which tier a spawn needs, report-outcome.sh reports what happened. The Read/Bash/SessionStart events carry COMPACTION, which is local: context_session.py makes no API and no model call, shrinking bulky tool output and large file reads before they reach the context window, with an exact archive and SHA-256 so the original is always recoverable. --no-policy is deliberate: the installer's default pins a behaviour policy at session start, and a plugin must not silently compete with Ponytail or whatever the user already runs. Anyone who wants it can run scripts/context_session.py --install-project with --policy-file instead.",
+  "_comment": "Two routes, one install. Agent events carry the BUCKET route: route-spawn.sh asks /v1/bucket which tier a spawn needs, report-outcome.sh reports what happened. The Read/Bash/SessionStart events carry COMPACTION, which is local: context_session.py makes no API and no model call, shrinking bulky tool output and large file reads before they reach the context window, with an exact archive and SHA-256 so the original is always recoverable. --no-policy is deliberate: the installer's default pins a behaviour policy at session start, and a plugin must not silently compete with Ponytail or whatever the user already runs. Anyone who wants it can run scripts/context_session.py --install-project with --policy-file instead. The Stop event carries the CACHE NUDGE: cache_miss_nudge.py reads only the usage counts of the transcript, and on a prompt-cache miss tells the user what was re-written and why; on an idle-gap miss over a large context it suggests /compact, since no hook can start compaction itself.",
   "hooks": {
     "PreToolUse": [
       {
@@ -62,6 +62,17 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/context_session.py --state-dir \"$HOME\"/.nadir/context --max-chars 8000 --no-policy",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/cache_miss_nudge.py --state-dir \"$HOME\"/.nadir/context",
             "timeout": 5
           }
         ]

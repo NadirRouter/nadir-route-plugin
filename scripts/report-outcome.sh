@@ -31,7 +31,11 @@
 #
 # Fail-open and non-blocking by construction: every path exits 0 with no stdout,
 # and the POST is backgrounded so a slow network never delays the agent.
-# Env: NADIR_API_KEY, NADIR_OUTCOME_URL, NADIR_TIMEOUT, NADIR_ROUTE_DISABLE=1.
+# It also carries the PARENT session's own prompt-cache misses, which the Stop
+# hook (cache_miss_nudge.py) accumulates: the main thread has no decision row,
+# so its recache cost rides on the next spawn's outcome as a delta.
+# Env: NADIR_API_KEY, NADIR_OUTCOME_URL, NADIR_TIMEOUT, NADIR_ROUTE_DISABLE=1,
+# NADIR_CONTEXT_STATE_DIR (default ~/.nadir/context, the compaction hooks' dir).
 
 [ "$NADIR_ROUTE_DISABLE" = "1" ] && { cat >/dev/null 2>&1; exit 0; }
 [ -n "$NADIR_API_KEY" ] || { cat >/dev/null 2>&1; exit 0; }
@@ -109,6 +113,43 @@ if isinstance(agent_id, str) and agent_id and isinstance(transcript, str) and tr
 # as a zero-turn run. Status is still worth recording; anything less is not.
 if len(body) < 2:
     raise SystemExit
+
+# The prompt-cache misses of the parent session itself, accumulated by the Stop hook in
+# the private per-session state the compaction hooks use. Forwarded as a DELTA
+# since the previous report, so summing the field over the decisions of an account
+# gives the total. Misses after the last spawn of a session are never reported and
+# a lost POST loses its delta; both accepted over a second network path. Two
+# ints are read, never message text. Only a spawn with a measured outcome
+# carries it: a background launch reports only its status, and the figure
+# waits for the next spawn that measured something.
+#
+# flock: two spawns finishing together run two of these hooks at once, and
+# without it both would forward the same delta. The Stop hook never runs while
+# a PostToolUse hook does, so its own atomic replace needs no lock.
+session = hook.get("session_id")
+measured = any(key not in ("tool_use_id", "status") for key in body)
+if measured and isinstance(session, str) and 0 < len(session) <= 1024:
+    try:
+        import fcntl, hashlib
+        state_dir = os.environ.get("NADIR_CONTEXT_STATE_DIR") or os.path.join(
+            os.path.expanduser("~"), ".nadir", "context")
+        path = os.path.join(state_dir, hashlib.sha256(session.encode()).hexdigest(), "cache.json")
+        with open(path, "r+", encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            state = json.load(fh)
+            tokens = int(state.get("recache_tokens") or 0) - int(state.get("reported_recache_tokens") or 0)
+            misses = int(state.get("misses") or 0) - int(state.get("reported_misses") or 0)
+            if tokens > 0 or misses > 0:
+                put("session_recache_tokens", tokens)
+                put("session_cache_misses", misses)
+                state["reported_recache_tokens"] = int(state.get("recache_tokens") or 0)
+                state["reported_misses"] = int(state.get("misses") or 0)
+                fh.seek(0)
+                fh.truncate()
+                json.dump(state, fh, indent=2)
+                fh.write("\n")
+    except Exception:
+        pass  # no session figure is better than a wrong one
 print(json.dumps(body))
 ') || exit 0
 [ -n "$req" ] || exit 0
