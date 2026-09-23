@@ -1,5 +1,5 @@
 {
   "name": "nadir-route",
-  "description": "Right-size every subagent spawn: a PreToolUse hook asks Nadir's free decision API which model the task needs and rewrites the spawn's model, using your harness's own aliases so the pick stays in your model family and generation. Complex spawns and your main thread are never touched. Fail-open: any error and the spawn proceeds exactly as the agent intended.",
-  "version": "0.7.1"
+  "description": "Right-size every prompt and every subagent spawn. A UserPromptSubmit hook asks Nadir's free decision API which tier the prompt needs and, when a cheaper tier suffices, has the agent delegate that work to a subagent on it; a PreToolUse hook right-sizes every spawn the same way, using your harness's own aliases so the pick stays in your model family and generation. Complex work and your main thread's own model are never touched. Fail-open: any error and the prompt or spawn proceeds exactly as intended.",
+  "version": "0.8.0"
 }

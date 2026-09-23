@@ -4,6 +4,13 @@ Right-size Claude Code's subagent spawns. A `PreToolUse` hook on the `Agent`
 tool asks [Nadir](https://getnadir.com)'s free decision API which model the task
 actually needs, then rewrites `model` in the spawn's input.
 
+Since 0.8.0 it also right-sizes the prompt itself: a `UserPromptSubmit` hook
+asks the same decision API which tier the user's prompt needs, priced against
+the model the session runs, and when a cheaper tier suffices it asks Claude to
+delegate that work to a subagent on it. Routing no longer waits for anyone to
+ask for subagents; complex prompts change nothing, and the main thread keeps
+its model and its warm cache.
+
 Nadir is a **decision engine here, not a gateway**. Your prompts and completions
 go straight from Claude Code to Anthropic on your own auth; Nadir is consulted
 out of band with the spawn's task text and never sees the request, the response,

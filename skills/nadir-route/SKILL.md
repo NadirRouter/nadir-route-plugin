@@ -1,13 +1,19 @@
 ---
 name: nadir-route
-description: "Explains that this session's subagent spawns are already right-sized by the Nadir PreToolUse hook, and points at the full nadir-route skill for classifying a task by hand. Invoke when the user asks why a subagent ran on a different model, how to disable or tune the routing, or wants a model-tier decision for work that is not a spawn."
+description: "Explains that this session's prompts and subagent spawns are already right-sized by the Nadir hooks (a UserPromptSubmit hook that asks you to delegate cheap work, a PreToolUse hook that rewrites spawn models), and points at the full nadir-route skill for classifying a task by hand. Invoke when the user asks why work was delegated or why a subagent ran on a different model, how to disable or tune the routing, or wants a model-tier decision by hand."
 ---
 
 # Nadir route (hook edition)
 
-This plugin routes **spawns only**. Its `PreToolUse` hook on the `Agent` tool asks
-Nadir's decision API which model the task needs and rewrites `model` in the
-spawn's input. Your main thread stays on the model you chose.
+This plugin routes at two points. A `UserPromptSubmit` hook asks Nadir's
+decision API which tier each prompt needs, priced against the model this session
+runs, and when a cheaper tier suffices it asks you to delegate that work to a
+subagent on it (you will see the request as hook context on the prompt; a
+`systemMessage` shows the user the same decision). A `PreToolUse` hook on the
+`Agent` tool then asks the same question about every spawn and rewrites `model`
+in its input. Your main thread stays on the model the user chose; the switch
+happens in a fresh subagent, where no prompt cache is lost. If a prompt needs
+conversation context a brief cannot carry, keep it inline and say so.
 
 For Superpowers sessions, use the full skill's `references/superpowers.md`
 active companion and set `NADIR_ROUTE_DISABLE=1` in the host session. Execute
