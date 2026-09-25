@@ -546,13 +546,15 @@ if [ -n "$NADIR_API_KEY" ]; then
     resp=$(printf '%s' "$req" | curl -s -m "${NADIR_TIMEOUT:-5}" -X POST \
         "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
         -H 'Content-Type: application/json' -H "X-API-Key: $NADIR_API_KEY" \
-        --data-binary @- -w '\nNADIR_HTTP_STATUS:%{http_code}') || exit 0
+        --data-binary @- -w '\nNADIR_HTTP_STATUS:%{http_code}') || true
 else
     resp=$(printf '%s' "$req" | curl -s -m "${NADIR_TIMEOUT:-5}" -X POST \
         "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
         -H 'Content-Type: application/json' --data-binary @- \
-        -w '\nNADIR_HTTP_STATUS:%{http_code}') || exit 0
+        -w '\nNADIR_HTTP_STATUS:%{http_code}') || true
 fi
+# A failed call (timeout, refused, DNS) still reaches the handler below with
+# status 000, so the route log records it; the spawn is left untouched either way.
 
 printf '%s' "$resp" | NADIR_HOOK_INPUT="$hook_input" python3 -c '
 import atexit, builtins, json, os, sys, time
@@ -617,7 +619,8 @@ try:
             }}))
         raise SystemExit
     if status != "200":
-        LOG["why"] = "no decision (HTTP %s)" % (status or "error")
+        LOG["why"] = ("no decision (timeout or network error)" if status in ("", "000")
+                      else "no decision (HTTP %s)" % status)
         raise SystemExit
     body = json.loads(payload)
     ti = json.loads(os.environ["NADIR_HOOK_INPUT"]).get("tool_input") or {}
