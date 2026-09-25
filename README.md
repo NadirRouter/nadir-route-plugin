@@ -30,6 +30,11 @@ frontier model. An Explore spawn that names no model now takes the rung below on
 complex (Sonnet under an Opus session, never level or up).
 `NADIR_EXPLORE_COMPLEX=inherit` turns that off.
 
+0.8.4 extends that to Explore briefs the classifier cannot see whole (65% of
+real ones were over the prefilter): they take the same rung without a decision,
+since no tier under that ladder sits above it. It also stops the prompt router
+classifying background-task notifications, which reach it as queued prompts.
+
 Nadir is a **decision engine here, not a gateway**. Your prompts and completions
 go straight from Claude Code to Anthropic on your own auth; Nadir is consulted
 out of band with the spawn's task text and never sees the request, the response,

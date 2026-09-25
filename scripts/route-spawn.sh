@@ -16,7 +16,9 @@
 # brief complex (11 of 12 sampled, at 0.93 or higher), so every search ran on
 # the frontier model. Claude Code ran Explore on Haiku before that. An Explore
 # spawn that names no model therefore takes the rung below on complex: sonnet,
-# never a move up or level. NADIR_EXPLORE_COMPLEX=inherit turns that off.
+# never a move up or level. An Explore brief too long to classify takes the
+# same rung, which is the ceiling of every decision that ladder allows.
+# NADIR_EXPLORE_COMPLEX=inherit turns all of it off.
 #
 # Transport and malformed-response failures leave the spawn untouched. A
 # model-policy denial from the server blocks it.
@@ -229,14 +231,27 @@ if len(prompt) > _max_chars:
     # the router is exactly what we just declined to consult.
     if _pin in ("haiku", "sonnet", "opus", "fable") and _pin != str(ti.get("model") or "").strip().lower():
         ti["model"] = _pin
-        # EMIT tags this as the FINAL answer of this hook, not a request body:
-        # the abstained path never reaches the response handler that normally
-        # prints, and the shell would otherwise POST this to /v1/bucket.
-        print("EMIT " + json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": ti,
-        }}))
+    else:
+        # An inherited Explore search too long to classify still takes its rung.
+        # Under the Explore ladder no tier sits above that rung, so it is the
+        # most conservative answer a decision could have given; a decision only
+        # ever moves such a search lower. Only on a session ranked above it.
+        _ranks = ("haiku", "sonnet", "opus", "fable")
+        _rung = (os.environ.get("NADIR_EXPLORE_COMPLEX") or "sonnet").strip().lower()
+        _base = (os.environ.get("NADIR_BASELINE_MODEL") or "").strip().lower()
+        _seat = next((a for a in _ranks if _base == a or _base.startswith("claude-" + a + "-")), None)
+        if not (ti.get("subagent_type") == "Explore" and not ti.get("model") and _rung in _ranks
+                and _seat and _ranks.index(_seat) > _ranks.index(_rung)):
+            raise SystemExit
+        ti["model"] = _rung
+    # EMIT tags this as the FINAL answer of this hook, not a request body:
+    # the abstained path never reaches the response handler that normally
+    # prints, and the shell would otherwise POST this to /v1/bucket.
+    print("EMIT " + json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "updatedInput": ti,
+    }}))
     raise SystemExit
 body = {
     "prompt": prompt,
@@ -614,6 +629,21 @@ if rr.get("decided_by") == "policy":
 # prefix. Missing/unknown coverage is not permission to change models.
 tokens = body.get("encoder_tokens")
 if body.get("input_truncated") is not False or type(tokens) is not int or tokens <= 0:
+    # Same rule as the oversized prefilter: an inherited Explore search the
+    # classifier could not see whole takes its rung, the ceiling of every
+    # decision the Explore ladder allows, unless the cache verdict says stay.
+    # Only on an affirmative input_truncated: missing or malformed coverage is
+    # a bad response, and a bad response fails open like every other one.
+    rung = (os.environ.get("NADIR_EXPLORE_COMPLEX") or "sonnet").strip().lower()
+    base = os.environ.get("NADIR_BASELINE_MODEL", "").strip().lower()
+    seat = next((name for name in RANK if base == name or base.startswith("claude-" + name + "-")), "")
+    if (body.get("input_truncated") is True
+            and ti.get("subagent_type") == "Explore" and not ti.get("model") and rung in RANK
+            and seat and RANK[seat] > RANK[rung] and adv.get("decision") != "stay_warm"):
+        ti["model"] = rung
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": ti,
+        }}))
     raise SystemExit
 
 # The cache verdict, and only `stay_warm`: every other decision (no_conflict,

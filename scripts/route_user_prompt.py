@@ -145,6 +145,10 @@ def decide(hook, env, now=None):
     # classify. Oversized text abstains rather than classify a prefix.
     if not text or text.startswith("/") or len(text.split()) < 4 or OPAQUE_BRIEF.fullmatch(text):
         return None
+    # A background-task notification reaches this event as a queued prompt. It
+    # is the harness reporting, not the user asking, so there is nothing to route.
+    if text.startswith("<task-notification>"):
+        return None
     try:
         max_chars = int(env.get("NADIR_MAX_PROMPT_CHARS") or 0)
     except ValueError:
