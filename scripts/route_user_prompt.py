@@ -64,11 +64,11 @@ TIER_EFFORT = {"simple": "low", "medium": "medium", "complex": "xhigh"}
 # a turn is short, and doing it inline beats the fixed cost of a fresh subagent.
 # ponytail: one fixed cut; tune it against outcome data once handoffs are measured.
 LONG_TOOL_CALLS = 8
-# An order instead of information only for clear cases (founder, 2026-09-25):
-# a cheaper model fits the whole task, the classifier is confident, the task is
-# long, Nadir's costing says handing it off is cheaper, and the prompt reads as
-# a whole task. A short prompt ("do 1 and 2") leans on the conversation, which a
-# brief cannot carry, so it only ever gets information.
+# Confidence decides who decides (founder, 2026-09-25). When Nadir is confident
+# and its cache-aware costing says handing the work off is cheaper, the note is
+# an order; below this confidence the agent decides from the information. A
+# short prompt ("do 1 and 2") counts as low confidence whatever the classifier
+# says: it leans on a conversation the classifier never sees.
 ORDER_MIN_CONFIDENCE = 0.8
 ORDER_MIN_WORDS = 12
 
@@ -202,6 +202,45 @@ def _cache_block(entry, model, now):
     return block
 
 
+def _codex_cache(path, model, now):
+    """The Codex session prompt-cache state from its rollout, whole or not at all.
+
+    The last `token_count` event carries the previous request: input_tokens
+    (cached included, as OpenAI counts it) and cached_input_tokens. Token
+    counts and a timestamp only; message text is never parsed.
+    """
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 262144))
+            raw = fh.read()
+    except OSError:
+        return None
+    for line in reversed(raw.split(b"\n")):
+        if b"token_count" not in line:
+            continue
+        try:
+            entry = json.loads(line)
+            usage = entry["payload"]["info"]["last_token_usage"]
+            cached, total = usage["cached_input_tokens"], usage["input_tokens"]
+        except Exception:
+            continue
+        if not all(type(v) is int and v >= 0 for v in (cached, total)) or cached > total:
+            return None
+        # ponytail: OpenAI keeps a prefix 5-10 minutes idle, so the 5m TTL is the safe floor.
+        block = {"model": model, "cached_tokens": cached, "ttl": "5m", "current_input_tokens": total}
+        try:
+            age = (now - datetime.fromisoformat(str(entry["timestamp"]).replace("Z", "+00:00"))).total_seconds()
+            if 0 <= age <= 86400:
+                block["seconds_since_last_request"] = age
+        except (KeyError, ValueError):
+            pass
+        return block
+    return None
+
+
 def _post(body):
     data = json.dumps(body).encode()
     headers = {"Content-Type": "application/json"}
@@ -275,6 +314,8 @@ def decide(hook, env, now=None):
             return None
         ladder = {t: slugs[t] for i, t in enumerate(TIERS) if t in slugs and i < position}
         source = "codex-hook"
+        # The cache is part of the decision: a warm session makes staying cheaper.
+        cache = _codex_cache(hook.get("transcript_path"), baseline, now or datetime.now(timezone.utc))
     else:
         entry = None
         if not baseline:
@@ -395,8 +436,7 @@ def decide(hook, env, now=None):
         confident = float(resp.get("confidence")) >= ORDER_MIN_CONFIDENCE
     except (TypeError, ValueError):
         confident = False
-    order = (priced and delegate_usd < inline_usd and confident and calls is not None
-             and calls >= LONG_TOOL_CALLS and len(text.split()) >= ORDER_MIN_WORDS)
+    order = priced and delegate_usd < inline_usd and confident and len(text.split()) >= ORDER_MIN_WORDS
     saves = f", saves about {_usd(inline_usd - delegate_usd)}" if priced and delegate_usd < inline_usd else ""
     command = ("with a complete, self-contained brief (files, acceptance criteria, constraints), then check "
                "the result and answer. Do this without asking. Keep the work yourself only if it needs "

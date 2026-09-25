@@ -72,6 +72,11 @@ costs done in place and handed off, and the note says both. In clear cases
 cheaper to hand off, and a prompt that reads as a whole task) the note asks
 Claude to hand the work off, unless it needs this conversation's context.
 
+0.9.3: confidence decides who decides. When Nadir is confident and its costing
+says handing off is cheaper, the note is an order; below that, Claude decides
+from the information. The costing counts your warm prompt cache, so a warm
+session that makes staying cheaper keeps the work where it is.
+
 Workers are how a subagent's effort gets set at all: Claude Code's Agent tool
 has no effort field, and it tells Claude to set `model` only when you ask for
 one. A worker Claude picks is left exactly as chosen; the spawn hook still logs
