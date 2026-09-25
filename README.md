@@ -66,6 +66,12 @@ the task is long (8+ tool calls), the note still speaks: keep the judgment on
 your model and hand routine, well-specified parts to a worker. A session's first
 prompt now offers Sonnet workers too, not only Haiku.
 
+0.9.2 prices it. When Nadir knows your session model, it estimates what the task
+costs done in place and handed off, and the note says both. In clear cases
+(a cheaper model fits the whole task, a confident rating, a long task that is
+cheaper to hand off, and a prompt that reads as a whole task) the note asks
+Claude to hand the work off, unless it needs this conversation's context.
+
 Workers are how a subagent's effort gets set at all: Claude Code's Agent tool
 has no effort field, and it tells Claude to set `model` only when you ask for
 one. A worker Claude picks is left exactly as chosen; the spawn hook still logs

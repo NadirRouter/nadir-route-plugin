@@ -64,6 +64,17 @@ TIER_EFFORT = {"simple": "low", "medium": "medium", "complex": "xhigh"}
 # a turn is short, and doing it inline beats the fixed cost of a fresh subagent.
 # ponytail: one fixed cut; tune it against outcome data once handoffs are measured.
 LONG_TOOL_CALLS = 8
+# An order instead of information only for clear cases (founder, 2026-09-25):
+# a cheaper model fits the whole task, the classifier is confident, the task is
+# long, Nadir's costing says handing it off is cheaper, and the prompt reads as
+# a whole task. A short prompt ("do 1 and 2") leans on the conversation, which a
+# brief cannot carry, so it only ever gets information.
+ORDER_MIN_CONFIDENCE = 0.8
+ORDER_MIN_WORDS = 12
+
+
+def _usd(value):
+    return "under $0.01" if value < 0.01 else "$%.2f" % value
 
 
 def _plugin_prefix():
@@ -300,12 +311,23 @@ def decide(hook, env, now=None):
         return None
 
     body = {"prompt": text, "source": source, "role": "main", "ladder": ladder}
+    context = {}
     if baseline:
         body["requested_model"] = baseline
+        # The model that runs the work if nobody hands it off. With it, and the
+        # server's turn estimate, the plan prices doing it here against handing
+        # it off, and the note can say what each costs.
+        context["warm_model"] = baseline
     if effort:
-        body["context"] = {"baseline_effort": effort}
+        context["baseline_effort"] = effort
     if cache:
         body["cache"] = cache
+        context["warm_prefix_tokens"] = cache["cached_tokens"]
+        context["cache_ttl"] = cache["ttl"]
+        if "seconds_since_last_request" in cache:
+            context["seconds_since_last_request"] = cache["seconds_since_last_request"]
+    if context:
+        body["context"] = context
     try:
         body["agent_policy"] = json.loads(env["NADIR_AGENT_POLICY"])
     except Exception:
@@ -364,6 +386,23 @@ def decide(hook, env, now=None):
                "brief (files, acceptance criteria, constraints) and check the result.")
     chosen = resp.get("selected_effort") if "selected_model" in resp else plan.get("effort")
     slugs = ", ".join(f'"{m}"' for m in ladder.values())  # TIERS order, so cheapest first
+    # Nadir's own costing of this task, when it had a warm model to price against.
+    inline_usd, delegate_usd = plan.get("inline_cost_usd"), plan.get("delegate_cost_usd")
+    priced = cheaper and all(type(v) in (int, float) for v in (inline_usd, delegate_usd))
+    money = (f"Nadir estimates about {_usd(inline_usd)} doing it yourself and "
+             f"{_usd(delegate_usd)} handing it off. " if priced else "")
+    try:
+        confident = float(resp.get("confidence")) >= ORDER_MIN_CONFIDENCE
+    except (TypeError, ValueError):
+        confident = False
+    order = (priced and delegate_usd < inline_usd and confident and calls is not None
+             and calls >= LONG_TOOL_CALLS and len(text.split()) >= ORDER_MIN_WORDS)
+    saves = f", saves about {_usd(inline_usd - delegate_usd)}" if priced and delegate_usd < inline_usd else ""
+    command = ("with a complete, self-contained brief (files, acceptance criteria, constraints), then check "
+               "the result and answer. Do this without asking. Keep the work yourself only if it needs "
+               "this conversation's context that a brief cannot carry, or the user named a model in "
+               "this prompt.")
+    LAST["order"] = order
     if codex_ladder:
         # Codex validates the effort against the child model, so only families
         # whose catalog entries accept every value in EFFORTS carry one. The
@@ -382,10 +421,15 @@ def decide(hook, env, now=None):
         suggestion = f'spawn_agent with model "{selected}"' + (
             f' and reasoning_effort "{chosen}"' if isinstance(chosen, str) and chosen in EFFORTS
             and efforts_ok(selected) else "")
-        directive = (read + f"Its pick: {suggestion}. " + you + "You decide: do it yourself, or call "
+        if order:
+            directive = (read + "It is routine and long. " + money + f"Hand it off: call {suggestion} "
+                         + command + tail)
+            return {"tier": tier, "model": selected, "suggestion": selected, "order": True,
+                    "summary": f"{size}hand off to {selected}{saves}", "directive": directive}
+        directive = (read + f"Its pick: {suggestion}. " + money + you + "You decide: do it yourself, or call "
                      f"spawn_agent with a cheaper model ({slugs}){choice}. " + handoff + tail)
         return {"tier": tier, "model": selected, "suggestion": selected,
-                "summary": f"{size}suggests {selected}", "directive": directive}
+                "summary": f"{size}suggests {selected}{saves}", "directive": directive}
     prefix = _plugin_prefix()
     names = ", ".join(prefix + w for w, _, _ in WORKERS) if prefix else ""
     if split:
@@ -396,17 +440,24 @@ def decide(hook, env, now=None):
         return {"tier": tier, "model": None, "suggestion": "split",
                 "summary": f"{size}routine parts to a worker", "directive": directive}
     worker = _worker_for(selected, chosen, tier) if prefix else None
+    target = f'subagent_type "{prefix}{worker}"' if worker else f'model "{selected}" (subagent_type "general-purpose")'
+    pick = prefix + worker if worker else selected
+    if order:
+        directive = (read + "It is routine and long. " + money + f"Hand it off: use the Agent tool with "
+                     f"{target} " + command)
+        return {"tier": tier, "model": selected, "suggestion": pick, "order": True,
+                "summary": f"{size}hand off to {pick}{saves}", "directive": directive}
     if worker:
-        directive = (read + f"Its pick: the {prefix}{worker} worker. " + you + "You decide: do it yourself, "
-                     f"or hand it to a Nadir worker with the Agent tool (subagent_type {names}; each runs a "
-                     "fixed model and effort, cheapest first). " + handoff)
-        return {"tier": tier, "model": selected, "suggestion": prefix + worker,
-                "summary": f"{size}suggests {prefix}{worker}", "directive": directive}
+        directive = (read + f"Its pick: the {prefix}{worker} worker. " + money + you + "You decide: do it "
+                     f"yourself, or hand it to a Nadir worker with the Agent tool (subagent_type {names}; each "
+                     "runs a fixed model and effort, cheapest first). " + handoff)
+        return {"tier": tier, "model": selected, "suggestion": pick,
+                "summary": f"{size}suggests {pick}{saves}", "directive": directive}
     directive = (read + f'Its pick: the Agent tool with model "{selected}" (subagent_type "general-purpose"). '
-                 + you + f"You decide: do it yourself, or hand it off with the Agent tool and a cheaper "
+                 + money + you + f"You decide: do it yourself, or hand it off with the Agent tool and a cheaper "
                  f"model ({slugs}). " + handoff)
-    return {"tier": tier, "model": selected, "suggestion": selected,
-            "summary": f"{size}suggests {selected}", "directive": directive}
+    return {"tier": tier, "model": selected, "suggestion": pick,
+            "summary": f"{size}suggests {pick}{saves}", "directive": directive}
 
 
 def main():
@@ -417,7 +468,7 @@ def main():
     result = decide(hook, os.environ)
     if LAST:
         log_event(dict(LAST, event="prompt", session=hook.get("session_id"),
-                       action="suggest" if result else "stay",
+                       action=("order" if result.get("order") else "suggest") if result else "stay",
                        suggested=result["suggestion"] if result else None))
     if not result:
         return

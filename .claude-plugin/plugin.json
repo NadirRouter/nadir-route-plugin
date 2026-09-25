@@ -1,5 +1,5 @@
 {
   "name": "nadir-route",
   "description": "Right-size every prompt and every subagent spawn. A UserPromptSubmit hook asks Nadir's free decision API which tier the prompt needs and, when a cheaper tier suffices, gives the agent Nadir's read and a pick from five worker agents (each a fixed model and effort: Haiku; Sonnet at low, medium or high effort; Opus at medium), and the agent decides whether to hand the work off. A PreToolUse hook right-sizes every other spawn, using your harness's own aliases so the pick stays in your model family and generation; a worker the agent picked is left as chosen. Complex work and your main thread's own model are never touched, except read-only Explore searches, which take the rung below (Sonnet under an Opus session). Fail-open: any error and the prompt or spawn proceeds exactly as intended.",
-  "version": "0.9.1"
+  "version": "0.9.2"
 }
