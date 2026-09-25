@@ -12,8 +12,8 @@ subagent, and the spawn hook then sees that spawn like any other.
 
 Two harnesses, one file. With NADIR_CODEX_LADDER set it speaks Codex: the
 session model is stated on the hook payload, the ladder maps tiers to catalog
-slugs, and the directive names spawn_agent with the slug and, on gpt-5.6
-slugs, the reasoning effort the plan chose. Otherwise it speaks Claude Code:
+slugs, and the directive names spawn_agent with the slug and, on gpt-6 and
+gpt-5.6 slugs, the reasoning effort the plan chose. Otherwise it speaks Claude Code:
 the session model is read off the transcript (usage accounting only, never
 message text), and the directive names the Agent tool with the alias enum.
 
@@ -170,9 +170,14 @@ def decide(hook, env, now=None):
         if not isinstance(raw, dict):
             return None
         slugs = {t: str(raw[t]) for t in TIERS if isinstance(raw.get(t), str) and raw[t].strip()}
-        # The session sits at the tier whose slug it runs; unknown slugs sit above
-        # the ladder. Only tiers strictly below are offered: never up, never level.
-        position = next((i for i, t in enumerate(TIERS) if slugs.get(t) == baseline), len(TIERS))
+        # The session sits at the tier whose slug it runs, and only tiers strictly
+        # below are offered: never up, never level. A session model that is not on
+        # the ladder cannot be placed. It used to sit above it, which put a
+        # gpt-6-sol session over a gpt-5.6 ladder and sent its complex prompts to
+        # gpt-5.6-sol, older and twice the price. Unplaceable means abstain.
+        position = next((i for i, t in enumerate(TIERS) if slugs.get(t) == baseline), None)
+        if position is None:
+            return None
         ladder = {t: slugs[t] for i, t in enumerate(TIERS) if t in slugs and i < position}
         source = "codex-hook"
     else:
@@ -180,12 +185,21 @@ def decide(hook, env, now=None):
         if not baseline:
             entry = _last_main_turn(hook.get("transcript_path"))
             baseline = str(((entry or {}).get("message") or {}).get("model") or "").strip()
-        if not baseline:
-            return None
-        alias = next((a for a in ALIASES if baseline.lower() == a or baseline.lower().startswith("claude-" + a + "-")), None)
-        if alias is None:
-            return None
-        rank = ALIASES.index(alias)
+        if baseline:
+            alias = next((a for a in ALIASES if baseline.lower() == a or baseline.lower().startswith("claude-" + a + "-")), None)
+            if alias is None:
+                return None
+            rank = ALIASES.index(alias)
+        else:
+            # The first prompt of a session: no assistant turn to read the model
+            # off yet, and Claude Code states none on this payload (nor, on a
+            # fresh start, on SessionStart). Staying silent here meant a session
+            # opened with its task, and every `claude -p`, was never routed.
+            # Haiku is the cheapest alias, so the simple tier cannot be a move
+            # up from any session model; medium waits for a readable baseline.
+            # ponytail: a session started on Haiku is told to delegate to Haiku
+            # once (no saving, one extra hop); its next prompt reads the model.
+            rank = ALIASES.index("haiku") + 1
         ladder = {"simple": "haiku", "medium": "sonnet"}
         raw = (env.get("NADIR_CLAUDE_LADDER") or "").strip()
         if raw:
@@ -203,8 +217,9 @@ def decide(hook, env, now=None):
     if not ladder:
         return None
 
-    body = {"prompt": text, "source": source, "role": "main",
-            "requested_model": baseline, "ladder": ladder}
+    body = {"prompt": text, "source": source, "role": "main", "ladder": ladder}
+    if baseline:
+        body["requested_model"] = baseline
     if effort:
         body["context"] = {"baseline_effort": effort}
     if cache:
@@ -247,8 +262,14 @@ def decide(hook, env, now=None):
             "this prompt.")
     if codex_ladder:
         chosen = resp.get("selected_effort") if "selected_model" in resp else plan.get("effort")
+        # Codex validates the effort against the child model, so only families
+        # whose catalog entries accept every value in EFFORTS carry one. The
+        # GPT-6 rungs (luna, sol, astra) accept low through max in the Codex
+        # 0.155 catalog; without the clause a Luna child inherits the parent
+        # effort, often xhigh.
         effort_text = (f' and reasoning_effort "{chosen}"'
-                       if isinstance(chosen, str) and chosen in EFFORTS and selected.startswith("gpt-5.6") else "")
+                       if isinstance(chosen, str) and chosen in EFFORTS
+                       and selected.startswith(("gpt-5.6", "gpt-6")) else "")
         directive = (head + f'call spawn_agent with model "{selected}"{effort_text}' + tail +
                      " The user installed this routing, so naming the model here is what they asked for.")
     else:

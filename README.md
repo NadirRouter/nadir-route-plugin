@@ -16,6 +16,13 @@ on the session model. The hook reads that model off the session transcript, and
 Claude Code writes the turn there a few milliseconds after the hook starts, so
 an inherited spawn now waits up to a second for it.
 
+0.8.2 routes a session's first prompt too. Claude Code states no model on that
+prompt and the transcript has no turn to read one off yet, so 0.8.1 stayed
+silent there, which left every session that opens with its task, and every
+`claude -p`, unrouted. With no readable model it now offers only simple work to
+Haiku, the cheapest alias, which cannot be a move up from any session model;
+medium waits for the next prompt, once the model is on record.
+
 Nadir is a **decision engine here, not a gateway**. Your prompts and completions
 go straight from Claude Code to Anthropic on your own auth; Nadir is consulted
 out of band with the spawn's task text and never sees the request, the response,
