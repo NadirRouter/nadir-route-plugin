@@ -427,9 +427,14 @@ def decide(hook, env, now=None):
                "brief (files, acceptance criteria, constraints) and check the result.")
     chosen = resp.get("selected_effort") if "selected_model" in resp else plan.get("effort")
     slugs = ", ".join(f'"{m}"' for m in ladder.values())  # TIERS order, so cheapest first
-    # Nadir's own costing of this task, when it had a warm model to price against.
+    # Nadir's own costing of this task, when it had a warm model to price against
+    # and a real horizon. `plan.turns` is null when the server priced over its
+    # assumed 2 turns (the size head off, or absent as on-prem): those numbers
+    # are not an estimate of this task, so they are neither shown nor acted on.
     inline_usd, delegate_usd = plan.get("inline_cost_usd"), plan.get("delegate_cost_usd")
-    priced = cheaper and all(type(v) in (int, float) for v in (inline_usd, delegate_usd))
+    horizon = plan.get("turns")
+    priced = (cheaper and type(horizon) is int and horizon > 0
+              and all(type(v) in (int, float) for v in (inline_usd, delegate_usd)))
     money = (f"Nadir estimates about {_usd(inline_usd)} doing it yourself and "
              f"{_usd(delegate_usd)} handing it off. " if priced else "")
     try:
