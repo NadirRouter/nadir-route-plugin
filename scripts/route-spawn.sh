@@ -178,10 +178,27 @@ if model:
 fi
 
 req=$(printf '%s' "$hook_input" | python3 -c '
-import json, math, os, sys
+import json, math, os, sys, time
 
 # Round-trip prefilter only; the server coverage check is authoritative.
 MAX_PROMPT_CHARS = 1362
+
+
+def _route_log(entry):
+    # One metadata line in the local route log (NADIR_ROUTE_LOG, default
+    # ~/.nadir/route-log.jsonl, off disables it). Never prompt text.
+    path = os.environ.get("NADIR_ROUTE_LOG") or os.path.join(os.path.expanduser("~"), ".nadir", "route-log.jsonl")
+    if path.strip().lower() in ("off", "0", "false", "no"):
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 5000000:
+            os.replace(path, path + ".1")
+        entry = dict({"ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), "harness": "claude-code"}, **entry)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 try:
     hook = json.load(sys.stdin)
@@ -223,6 +240,11 @@ except (TypeError, ValueError):
 if _max_chars <= 0:
     _max_chars = MAX_PROMPT_CHARS
 if len(prompt) > _max_chars:
+    _asked = ti.get("model") or None
+    _spawn_log = {"event": "spawn", "session": hook.get("session_id"), "tool_use_id": hook.get("tool_use_id"),
+                  "subagent_type": ti.get("subagent_type"), "requested": _asked,
+                  "session_model": os.environ.get("NADIR_BASELINE_MODEL") or None,
+                  "tier": None, "nadir_pick": None, "applied": None, "why": "brief too long to classify"}
     try:
         _pin = str((json.loads(os.environ["NADIR_AGENT_POLICY"]) or {}).get("subagent") or "").strip().lower()
     except Exception:
@@ -242,8 +264,14 @@ if len(prompt) > _max_chars:
         _seat = next((a for a in _ranks if _base == a or _base.startswith("claude-" + a + "-")), None)
         if not (ti.get("subagent_type") == "Explore" and not ti.get("model") and _rung in _ranks
                 and _seat and _ranks.index(_seat) > _ranks.index(_rung)):
+            _route_log(_spawn_log)
             raise SystemExit
         ti["model"] = _rung
+        _spawn_log["why"] = "Explore rung, brief too long to classify"
+    if _spawn_log["why"] == "brief too long to classify":
+        _spawn_log["why"] = "policy pin, brief too long to classify"
+    _spawn_log["applied"] = ti["model"]
+    _route_log(_spawn_log)
     # EMIT tags this as the FINAL answer of this hook, not a request body:
     # the abstained path never reaches the response handler that normally
     # prints, and the shell would otherwise POST this to /v1/bucket.
@@ -527,7 +555,49 @@ else
 fi
 
 printf '%s' "$resp" | NADIR_HOOK_INPUT="$hook_input" python3 -c '
-import json, os, sys
+import atexit, builtins, json, os, sys, time
+
+
+def _route_log(entry):
+    # One metadata line in the local route log (NADIR_ROUTE_LOG, default
+    # ~/.nadir/route-log.jsonl, off disables it). Never prompt text.
+    path = os.environ.get("NADIR_ROUTE_LOG") or os.path.join(os.path.expanduser("~"), ".nadir", "route-log.jsonl")
+    if path.strip().lower() in ("off", "0", "false", "no"):
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 5000000:
+            os.replace(path, path + ".1")
+        entry = dict({"ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), "harness": "claude-code"}, **entry)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+# Logged once this handler exits, whatever path it took. Every decision it
+# emits goes through print, so wrapping print records exactly what the harness
+# was told to run rather than what this file meant to tell it.
+try:
+    _hook = json.loads(os.environ["NADIR_HOOK_INPUT"])
+    _ti0 = _hook.get("tool_input") or {}
+except Exception:
+    _hook, _ti0 = {}, {}
+LOG = {"event": "spawn", "session": _hook.get("session_id"), "tool_use_id": _hook.get("tool_use_id"),
+       "subagent_type": _ti0.get("subagent_type"), "requested": _ti0.get("model") or None,
+       "session_model": os.environ.get("NADIR_BASELINE_MODEL") or None,
+       "tier": None, "nadir_pick": None, "applied": None}
+atexit.register(lambda: _route_log(LOG))
+
+
+def print(text, *args, **kwargs):
+    try:
+        out = json.loads(text).get("hookSpecificOutput") or {}
+        LOG["applied"] = ((out.get("updatedInput") or {}).get("model")
+                          if out.get("permissionDecision") == "allow" else "DENIED")
+    except Exception:
+        pass
+    builtins.print(text, *args, **kwargs)
 
 # The Agent tool accepts these four and nothing else. Ranked cheapest first so
 # the hook can refuse to move a spawn UP: this is a cost-control hook, and
@@ -547,6 +617,7 @@ try:
             }}))
         raise SystemExit
     if status != "200":
+        LOG["why"] = "no decision (HTTP %s)" % (status or "error")
         raise SystemExit
     body = json.loads(payload)
     ti = json.loads(os.environ["NADIR_HOOK_INPUT"]).get("tool_input") or {}
@@ -563,6 +634,8 @@ try:
     # or null must fail open and route normally, not raise on the .get() below.
     adv = body.get("cache_advice")
     adv = adv if isinstance(adv, dict) else {}
+    LOG["tier"] = tier or None
+    LOG["nadir_pick"] = body.get("selected_model") if isinstance(body.get("selected_model"), str) else None
 except Exception:
     raise SystemExit
 

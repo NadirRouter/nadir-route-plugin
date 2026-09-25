@@ -35,6 +35,15 @@ real ones were over the prefilter): they take the same rung without a decision,
 since no tier under that ladder sits above it. It also stops the prompt router
 classifying background-task notifications, which reach it as queued prompts.
 
+0.8.5 writes a local route log, `~/.nadir/route-log.jsonl`: what Nadir decided
+for each prompt and spawn, and which model the main thread and each subagent
+then ran on. Metadata only, never prompt text; `NADIR_ROUTE_LOG=off` stops it.
+Follow it live:
+
+```bash
+python3 ~/.claude/plugins/cache/nadir/nadir-route/*/scripts/route_log.py -f
+```
+
 Nadir is a **decision engine here, not a gateway**. Your prompts and completions
 go straight from Claude Code to Anthropic on your own auth; Nadir is consulted
 out of band with the spawn's task text and never sees the request, the response,

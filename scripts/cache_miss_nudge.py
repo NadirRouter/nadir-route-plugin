@@ -14,7 +14,7 @@ private per-session directory the compaction hooks use. No network, no model.
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -137,6 +137,27 @@ def message(miss, state):
     return text
 
 
+def log_turn(session_id, model):
+    """One line in the local route log: the model the main thread just ran on.
+
+    The other half of the prompt line route_user_prompt.py wrote. NADIR_ROUTE_LOG
+    moves it (default ~/.nadir/route-log.jsonl), off stops it. Model id only.
+    """
+    path = os.environ.get("NADIR_ROUTE_LOG") or os.path.join(os.path.expanduser("~"), ".nadir", "route-log.jsonl")
+    if path.strip().lower() in ("off", "0", "false", "no"):
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 5_000_000:
+            os.replace(path, path + ".1")
+        line = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "harness": "claude-code",
+                "event": "turn", "session": session_id, "main_model": model}
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line) + "\n")
+    except Exception:
+        pass
+
+
 def handle(event, *, state_dir):
     if not isinstance(event, dict) or os.environ.get("NADIR_CONTEXT_DISABLE") == "1":
         return {}
@@ -157,11 +178,15 @@ def handle(event, *, state_dir):
         state = {}
     if not isinstance(state, dict):
         state = {}
+    before = (state.get("last") or {}).get("id")
     try:
         miss = scan(transcript, state)
     except OSError:
         return {}
     write_json(path, state, replace=True)
+    last = state.get("last") or {}
+    if last.get("model") and last.get("id") != before:
+        log_turn(session_id, last["model"])
     text = message(miss, state)
     return {"systemMessage": text} if text else {}
 

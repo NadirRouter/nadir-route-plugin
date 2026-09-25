@@ -25,9 +25,11 @@
 # `worktreeBranch` — a denylist would leak the day the CLI adds a field. Only
 # counters, a status, and a model id ever leave the machine.
 #
-# Requires NADIR_API_KEY. An anonymous /v1/bucket decision writes no row by the
-# privacy contract, so there is nothing for an outcome to attach to; without a
-# key this hook exits silently rather than posting into the void.
+# The POST requires NADIR_API_KEY. An anonymous /v1/bucket decision writes no
+# row by the privacy contract, so there is nothing for an outcome to attach to;
+# without a key nothing is posted. The local route log line (the model the
+# subagent actually ran on, NADIR_ROUTE_LOG, default ~/.nadir/route-log.jsonl)
+# is written either way: it is how a user sees routing work without a key.
 #
 # Fail-open and non-blocking by construction: every path exits 0 with no stdout,
 # and the POST is backgrounded so a slow network never delays the agent.
@@ -38,10 +40,9 @@
 # NADIR_CONTEXT_STATE_DIR (default ~/.nadir/context, the compaction hooks' dir).
 
 [ "$NADIR_ROUTE_DISABLE" = "1" ] && { cat >/dev/null 2>&1; exit 0; }
-[ -n "$NADIR_API_KEY" ] || { cat >/dev/null 2>&1; exit 0; }
 
 req=$(cat | python3 -c '
-import json, os, sys, glob
+import json, os, sys, glob, time
 
 try:
     hook = json.load(sys.stdin)
@@ -52,6 +53,25 @@ try:
     if not isinstance(tuid, str) or not tuid or not isinstance(resp, dict):
         raise SystemExit
 except Exception:
+    raise SystemExit
+
+# The local route log: which model this subagent actually ran on, the other half
+# of the spawn line route-spawn.sh wrote. Model id and status only.
+_log_path = os.environ.get("NADIR_ROUTE_LOG") or os.path.join(os.path.expanduser("~"), ".nadir", "route-log.jsonl")
+if _log_path.strip().lower() not in ("off", "0", "false", "no"):
+    try:
+        os.makedirs(os.path.dirname(_log_path) or ".", exist_ok=True)
+        if os.path.exists(_log_path) and os.path.getsize(_log_path) > 5000000:
+            os.replace(_log_path, _log_path + ".1")
+        with open(_log_path, "a") as fh:
+            fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                                 "harness": "claude-code", "event": "spawn_result",
+                                 "session": hook.get("session_id"), "tool_use_id": tuid,
+                                 "resolved_model": resp.get("resolvedModel") if isinstance(resp.get("resolvedModel"), str) else None,
+                                 "status": resp.get("status") if isinstance(resp.get("status"), str) else None}) + "\n")
+    except Exception:
+        pass
+if not os.environ.get("NADIR_API_KEY"):
     raise SystemExit
 
 body = {"tool_use_id": tuid[:200]}

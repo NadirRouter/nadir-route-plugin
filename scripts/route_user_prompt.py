@@ -38,6 +38,30 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 TIERS = ("simple", "medium", "complex")
 MAX_PROMPT_CHARS = 1362
 OPAQUE_BRIEF = re.compile(r"gAAAAA[A-Za-z0-9_-]{40,}={0,2}")
+# The decision this prompt got, for the local log; filled once /v1/bucket answers.
+LAST = {}
+
+
+def log_event(entry):
+    """Append one metadata line to the local route log; never prompt text.
+
+    ~/.nadir/route-log.jsonl by default, NADIR_ROUTE_LOG=<path> moves it and
+    NADIR_ROUTE_LOG=off stops it. It is how a user sees what Nadir decided and
+    which model then ran, without a key or a dashboard.
+    """
+    path = os.environ.get("NADIR_ROUTE_LOG") or os.path.join(os.path.expanduser("~"), ".nadir", "route-log.jsonl")
+    if path.strip().lower() in ("off", "0", "false", "no"):
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        # ponytail: one rotation at 5 MB; a real rotator if anyone needs more history.
+        if os.path.exists(path) and os.path.getsize(path) > 5_000_000:
+            os.replace(path, path + ".1")
+        line = dict({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds")}, **entry)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line) + "\n")
+    except Exception:
+        pass
 
 
 def _last_main_turn(path):
@@ -239,6 +263,12 @@ def decide(hook, env, now=None):
         return None
     if not isinstance(resp, dict):
         return None
+    _plan = resp.get("plan") if isinstance(resp.get("plan"), dict) else {}
+    LAST.update({"harness": "codex" if codex_ladder else "claude-code",
+                 "tier": str(resp.get("routing_tier") or _plan.get("tier") or resp.get("bucket") or "") or None,
+                 "confidence": resp.get("confidence") if isinstance(resp.get("confidence"), (int, float)) else None,
+                 "session_model": baseline or None,
+                 "nadir_pick": resp.get("selected_model") if isinstance(resp.get("selected_model"), str) else None})
     # The same correctness gate as the spawn hooks: the classifier must have seen
     # the whole prompt, and a warm-cache verdict keeps the work where it is.
     tokens = resp.get("encoder_tokens")
@@ -287,6 +317,9 @@ def main():
     except Exception:
         return
     result = decide(hook, os.environ)
+    if LAST:
+        log_event(dict(LAST, event="prompt", session=hook.get("session_id"),
+                       action="delegate" if result else "stay"))
     if not result:
         return
     print(json.dumps({
