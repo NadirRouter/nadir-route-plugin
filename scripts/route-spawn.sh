@@ -80,18 +80,38 @@ hook_input=$(cat)
 # Sidechain turns are skipped deliberately: they are subagents, and a previous
 # Haiku subagent must not be mistaken for the session baseline, which would make
 # the hook believe it is already at the cheap tier and stop routing entirely.
+#
+# The transcript is appended asynchronously, so a spawn issued by the FIRST
+# assistant turn of a session reaches this hook before that turn is on disk,
+# usually before the file exists at all. With no baseline an inherited spawn
+# keeps its model, so those spawns went unrouted: 9 of 10 when Claude Code
+# 2.1.282 was driven by the scripted API in test_route_native.py, where the
+# turn landed 10-36 ms after the hook started in 12 of 12 runs. An inherited
+# spawn therefore waits up to BASELINE_WAIT_SECONDS for a main-thread turn to
+# appear. Once one exists nothing waits, so only a session's first spawns pay
+# it; a session that persists no transcript pays the whole wait, and
+# NADIR_BASELINE_MODEL skips it.
 if [ -z "$NADIR_BASELINE_MODEL" ]; then
     NADIR_BASELINE_MODEL=$(printf '%s' "$hook_input" | python3 -c '
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 
 ALIASES = ("haiku", "sonnet", "opus", "fable")
+BASELINE_WAIT_SECONDS = 1.0
 try:
     hook = json.load(sys.stdin)
+    ti = hook.get("tool_input") or {}
+    # An explicit spawn model is what the routing compares against, so the
+    # baseline only feeds pricing context there and is not worth a wait.
+    wait = 0 if isinstance(ti, dict) and ti.get("model") else BASELINE_WAIT_SECONDS
 except Exception:
     raise SystemExit
-path = str((hook or {}).get("transcript_path") or "")
-if not path:
+
+
+def locate():
+    path = str(hook.get("transcript_path") or "")
+    if path:
+        return path
     # Older harness builds omit the field. The session id names the same file,
     # and globbing it avoids reimplementing the project-directory slug.
     session = str(os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
@@ -102,35 +122,48 @@ if not path:
         found = sorted(root.glob("*/" + session + ".jsonl"),
                        key=lambda p: p.stat().st_mtime, reverse=True)
     except OSError:
-        raise SystemExit
-    if not found:
-        raise SystemExit
-    path = str(found[0])
-try:
-    # Tail only: these files reach tens of megabytes and the answer is at the
-    # end. A turn split by the boundary fails to parse and the next one back is
-    # used, which is why this walks backwards rather than taking the first hit.
-    with open(path, "rb") as stream:
-        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 262144))
-        raw = stream.read()
-except OSError:
-    raise SystemExit
-for line in reversed(raw.split(b"\n")):
-    if b"assistant" not in line:
-        continue
+        return None
+    return str(found[0]) if found else None
+
+
+def last_main_model(path):
     try:
-        entry = json.loads(line)
-    except Exception:
-        continue
-    if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain"):
-        continue
-    message = entry.get("message")
-    model = (message or {}).get("model") if isinstance(message, dict) else None
-    # An alias here would buy a pricing_unknown plan, which is worse than
-    # sending nothing, so it is dropped the same way a hand-set one is.
-    if isinstance(model, str) and model and model.lower() not in ALIASES:
-        print(model)
+        # Tail only: these files reach tens of megabytes and the answer is at
+        # the end. A turn split by the boundary fails to parse and the next one
+        # back is used, which is why this walks backwards rather than taking
+        # the first hit.
+        with open(path, "rb") as stream:
+            stream.seek(max(0, os.fstat(stream.fileno()).st_size - 262144))
+            raw = stream.read()
+    except OSError:
+        return None
+    for line in reversed(raw.split(b"\n")):
+        if b"assistant" not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        message = entry.get("message")
+        model = (message or {}).get("model") if isinstance(message, dict) else None
+        # An alias here would buy a pricing_unknown plan, which is worse than
+        # sending nothing, so it is dropped the same way a hand-set one is.
+        if isinstance(model, str) and model and model.lower() not in ALIASES:
+            return model
+    return None
+
+
+deadline = time.monotonic() + wait
+while True:
+    path = locate()
+    model = last_main_model(path) if path else None
+    if model or time.monotonic() >= deadline:
         break
+    time.sleep(0.02)
+if model:
+    print(model)
 ' 2>/dev/null) || NADIR_BASELINE_MODEL=""
     export NADIR_BASELINE_MODEL
 fi

@@ -11,6 +11,11 @@ delegate that work to a subagent on it. Routing no longer waits for anyone to
 ask for subagents; complex prompts change nothing, and the main thread keeps
 its model and its warm cache.
 
+0.8.1 routes spawns issued by a session's first turn, which 0.8.0 mostly left
+on the session model. The hook reads that model off the session transcript, and
+Claude Code writes the turn there a few milliseconds after the hook starts, so
+an inherited spawn now waits up to a second for it.
+
 Nadir is a **decision engine here, not a gateway**. Your prompts and completions
 go straight from Claude Code to Anthropic on your own auth; Nadir is consulted
 out of band with the spawn's task text and never sees the request, the response,
@@ -64,7 +69,7 @@ Set these in `~/.claude/settings.json` under `env`, or export them.
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `NADIR_ROUTE_DISABLE` | unset | `1` turns the hook off |
-| `NADIR_BASELINE_MODEL` | unset | the model your sessions run on, e.g. `claude-opus-5`. **Set this for a savings figure**: Claude Code fills `tool_input.model` only when a spawn names one explicitly, so without it Nadir has no baseline to price against and decisions log unpriced |
+| `NADIR_BASELINE_MODEL` | unset | the model your sessions run on, e.g. `claude-opus-5`, which inherited spawns are routed and priced against. Unset, the hook reads it off the session transcript; set it to pin one, or for sessions that persist no transcript, where an inherited spawn waits up to a second for one and then keeps its model |
 | `NADIR_API_KEY` | unset | attributes decisions to your account and surfaces them on the dashboard. Keyless calls store no row at all, by design, so your dashboard stays empty |
 | `NADIR_CLAUDE_LADDER` | `{"simple":"haiku","medium":"sonnet"}` | retune the table above. Map a tier to `inherit` to leave it alone; `{"simple":"inherit","medium":"inherit"}` is audit mode — decisions recorded, nothing changed |
 | `NADIR_AGENT_POLICY` | `{"subagent":"auto"}` keyless | raw JSON role policy. Pin a value (`{"subagent":"haiku"}`) instead of letting the router pick |
@@ -87,11 +92,17 @@ The cost of that design is that "working" and "doing nothing" look identical, so
 check explicitly rather than assuming:
 
 ```bash
+hook=$(python3 -c 'import json, os; d = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"); print(json.load(open(d + "/plugins/installed_plugins.json"))["plugins"]["nadir-route@nadir"][0]["installPath"])')
 echo '{"tool_name":"Agent","tool_input":{"prompt":"rename a variable in one file","description":"rename var","subagent_type":"Explore"}}' \
-  | sh ~/.claude/plugins/*/nadir-route/scripts/route-spawn.sh
+  | NADIR_BASELINE_MODEL=claude-opus-5 sh "$hook/scripts/route-spawn.sh"
 ```
 
-Expect JSON containing `"model":"haiku"`. Empty output means it is not routing.
+Expect JSON containing `"model":"haiku"`. The first line finds the version
+Claude Code actually runs: an update leaves the previous version's directory in
+the plugin cache, so a glob over it can pick the old hook. The baseline stands
+in for the session transcript a real spawn is read against: without either, an
+inherited spawn keeps its model by design and this prints nothing. With it,
+empty output means it is not routing.
 An invalid `NADIR_API_KEY` produces exactly the same silence as an unreachable
 network, so if you are keyed, re-run the same check with `NADIR_API_KEY=` — if it
 starts working, your key is being rejected.
