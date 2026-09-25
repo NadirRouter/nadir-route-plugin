@@ -35,7 +35,10 @@ def describe(e):
         applied = e.get("applied") or "unchanged"
         tier = f"tier {e.get('tier')}  Nadir -> {e.get('nadir_pick')}" if e.get("tier") else "no decision"
         why = f"  ({e['why']})" if e.get("why") else ""
-        what = f"spawn    {e.get('subagent_type') or 'agent'}  {tier}  applied {applied}{why}"
+        agent = e.get("subagent_type") or "agent"
+        if e.get("agent_model"):
+            agent += f" (defines {e['agent_model']})"
+        what = f"spawn    {agent}  {tier}  applied {applied}{why}"
     elif kind == "spawn_result":
         what = f"result   subagent ran on {e.get('resolved_model')}"
     elif kind == "turn":

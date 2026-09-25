@@ -76,7 +76,10 @@ Three rules, all deliberate:
   `ANTHROPIC_DEFAULT_*_MODEL` config, so a routed spawn lands in your family and
   your generation rather than one this plugin hardcoded.
 - **It never moves a spawn up on its own.** If the agent already asked for
-  something cheaper than the routed tier, that stands. The one exception is an
+  something cheaper than the routed tier, that stands. So does a cheaper model
+  set in the agent's own definition (a Haiku agent such as
+  `caveman:cavecrew-investigator` or the built-in `claude-code-guide`), which is
+  what a spawn naming no model runs on. The one exception is an
   explicit policy pin from your account, which is a standing instruction from
   you and so wins in either direction. A pin naming a full model id
   (`claude-sonnet-5`) cannot be expressed on the alias enum at all, so it falls

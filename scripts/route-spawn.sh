@@ -72,6 +72,70 @@ esac
 
 hook_input=$(cat)
 
+# The model the named agent's own definition sets. A spawn that names no model
+# runs on THAT, not on the session model, so it is the ceiling a rewrite is
+# measured against. Compared against the session instead, a Haiku agent
+# (nadir-simple from the installer tier pack, caveman:cavecrew-investigator,
+# the built-in claude-code-guide) read as an Opus spawn, and a medium decision
+# moved it UP to Sonnet. Lookup order follows Claude Code: project
+# .claude/agents, then user agents, then the built-ins below; a plugin agent
+# ("plugin:name") only in that plugin agents/ directory. Empty when the agent
+# inherits or no definition is found, which keeps the session comparison.
+# ponytail: an agent defined outside files (--agents JSON, the SDK) is not
+# seen and still compares against the session model.
+NADIR_AGENT_MODEL=$(printf '%s' "$hook_input" | python3 -c '
+import json, os, re, sys
+from pathlib import Path
+
+# Claude Code 2.1.280 built-ins that set a model; every other built-in inherits.
+BUILTIN = {"claude-code-guide": "haiku", "statusline-setup": "sonnet"}
+QUOTES = "\"" + chr(39)
+
+
+def defined_model(root, name):
+    """The model field of the agent called name under root; "" if it sets none, None if absent."""
+    for path in sorted(root.rglob("*.md")) if root.is_dir() else ():
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        if not text.startswith("---"):
+            continue
+        fields = dict(re.findall(r"(?m)^(name|model):[ \t]*(.*?)[ \t]*$", text[3:].split("\n---", 1)[0]))
+        if fields.get("name", path.stem).strip(QUOTES) == name:
+            return fields.get("model", "").strip(QUOTES)
+    return None
+
+
+try:
+    hook = json.load(sys.stdin)
+    ti = hook.get("tool_input") or {}
+    kind = ti.get("subagent_type")
+    if ti.get("model") or not isinstance(kind, str) or not kind:
+        raise SystemExit
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    plugin, _, name = kind.rpartition(":")
+    if plugin:
+        installed = json.loads((config / "plugins" / "installed_plugins.json").read_text()).get("plugins") or {}
+        roots = [Path(entry["installPath"]) / "agents"
+                 for key, entries in installed.items() if key.split("@")[0] == plugin
+                 for entry in (entries if isinstance(entries, list) else [entries])
+                 if isinstance(entry, dict) and entry.get("installPath")]
+    else:
+        project = os.environ.get("CLAUDE_PROJECT_DIR") or hook.get("cwd")
+        roots = ([Path(project) / ".claude" / "agents"] if project else []) + [config / "agents"]
+    model = next((m for m in (defined_model(root, name) for root in roots) if m is not None), None)
+    if model is None and not plugin:
+        model = BUILTIN.get(name)
+except Exception:
+    raise SystemExit
+model = (model or "").strip().lower()
+if model and model != "inherit":
+    print(next((a for a in ("haiku", "sonnet", "opus", "fable")
+                if model == a or model.startswith("claude-" + a + "-")), model))
+' 2>/dev/null) || NADIR_AGENT_MODEL=""
+export NADIR_AGENT_MODEL
+
 # The baseline is the model THIS session runs, and the session states it.
 #
 # Claude Code fills tool_input.model only when a spawn names one explicitly, so
@@ -112,7 +176,8 @@ try:
     ti = hook.get("tool_input") or {}
     # An explicit spawn model is what the routing compares against, so the
     # baseline only feeds pricing context there and is not worth a wait.
-    wait = 0 if isinstance(ti, dict) and ti.get("model") else BASELINE_WAIT_SECONDS
+    wait = (0 if isinstance(ti, dict) and (ti.get("model") or os.environ.get("NADIR_AGENT_MODEL"))
+            else BASELINE_WAIT_SECONDS)
 except Exception:
     raise SystemExit
 
@@ -243,6 +308,7 @@ if len(prompt) > _max_chars:
     _asked = ti.get("model") or None
     _spawn_log = {"event": "spawn", "session": hook.get("session_id"), "tool_use_id": hook.get("tool_use_id"),
                   "subagent_type": ti.get("subagent_type"), "requested": _asked,
+                  "agent_model": os.environ.get("NADIR_AGENT_MODEL") or None,
                   "session_model": os.environ.get("NADIR_BASELINE_MODEL") or None,
                   "tier": None, "nadir_pick": None, "applied": None, "why": "brief too long to classify"}
     try:
@@ -288,13 +354,15 @@ body = {
     # and a pilot cannot show which decisions came from its coding agents.
     "source": "claude-code-hook",
     # The model this spawn would have run on without Nadir. Claude Code puts
-    # `model` in the tool input only when the spawn names one explicitly;
-    # default spawns inherit the session model, and the hook cannot see it, so
-    # NADIR_BASELINE_MODEL supplies it. Without a baseline the server has
+    # `model` in the tool input only when the spawn names one explicitly; other
+    # spawns run on their agent definition model (NADIR_AGENT_MODEL) or inherit
+    # the session model, which the hook cannot see, so NADIR_BASELINE_MODEL
+    # supplies it. Without a baseline the server has
     # nothing to price the decision against and every row logs unpriced — the
     # dashboard reads "N decisions, $0.00", which is the opposite of the point.
     "role": "subagent",
-    "requested_model": ti.get("model") or os.environ.get("NADIR_BASELINE_MODEL") or "",
+    "requested_model": (ti.get("model") or os.environ.get("NADIR_AGENT_MODEL")
+                        or os.environ.get("NADIR_BASELINE_MODEL") or ""),
 }
 # The harness already knows what KIND of agent this is, and it is the grouping
 # key for the one number the decision is still guessing at: how many turns a run
@@ -516,7 +584,8 @@ if ti.get("subagent_type") == "Explore" and not ti.get("model"):
 # Declare the same no-upgrade boundary the response handler enforces. Otherwise
 # an inherited Haiku session advertises a Sonnet swap that it will never apply.
 _aliases = ("haiku", "sonnet", "opus", "fable")
-_current = str(ti.get("model") or os.environ.get("NADIR_BASELINE_MODEL") or "").strip().lower()
+_current = str(ti.get("model") or os.environ.get("NADIR_AGENT_MODEL")
+               or os.environ.get("NADIR_BASELINE_MODEL") or "").strip().lower()
 _current_alias = next((a for a in _aliases if _current == a or _current.startswith("claude-" + a + "-")), None)
 for _tier, _model in _ladder.items():
     _alias = str(_model).strip().lower()
@@ -587,6 +656,7 @@ except Exception:
     _hook, _ti0 = {}, {}
 LOG = {"event": "spawn", "session": _hook.get("session_id"), "tool_use_id": _hook.get("tool_use_id"),
        "subagent_type": _ti0.get("subagent_type"), "requested": _ti0.get("model") or None,
+       "agent_model": os.environ.get("NADIR_AGENT_MODEL") or None,
        "session_model": os.environ.get("NADIR_BASELINE_MODEL") or None,
        "tier": None, "nadir_pick": None, "applied": None}
 atexit.register(lambda: _route_log(LOG))
@@ -759,7 +829,8 @@ if alias not in RANK:
     # Unmapped tier ("complex"), "inherit", or a value the tool would reject.
     raise SystemExit
 
-current = str(ti.get("model") or "").strip().lower()
+# A named model, else the agent definition model, else the session model.
+current = str(ti.get("model") or os.environ.get("NADIR_AGENT_MODEL") or "").strip().lower()
 if not current:
     baseline = os.environ.get("NADIR_BASELINE_MODEL", "").strip().lower()
     # Only compare the tier here; never invent a concrete model from an alias.
@@ -768,7 +839,8 @@ pinned = rr.get("decided_by") == "policy"
 if current == alias:
     raise SystemExit
 if current in RANK and RANK[current] <= RANK[alias] and not pinned:
-    raise SystemExit  # already at or below the routed tier
+    LOG["why"] = "already at or below the routed tier"
+    raise SystemExit
 if current not in RANK and not pinned:
     # Unknown inherited baselines and unrankable explicit models both stay:
     # without their tier, a replacement could increase cost.
