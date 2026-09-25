@@ -592,6 +592,14 @@ for _tier, _model in _ladder.items():
     if (_current_alias is None or
             (_alias in _aliases and _aliases.index(_alias) >= _aliases.index(_current_alias))):
         _ladder[_tier] = "inherit"
+# A Nadir worker (the agents this plugin ships, or nadir-simple and nadir-medium
+# from the installer tier pack) is a model and effort the agent chose itself,
+# with the read from Nadir in hand, so the choice stands. The decision is still
+# asked for, so the dashboard shows the Nadir tier beside the choice, but every
+# tier is declared no-change and nothing is priced as moved.
+_pick = str(ti.get("subagent_type") or "")
+if _pick.startswith("nadir-route:") or _pick in ("nadir-simple", "nadir-medium"):
+    _ladder = {_tier: "inherit" for _tier in _ladder}
 body["ladder"] = _ladder
 try:
     body["agent_policy"] = json.loads(os.environ["NADIR_AGENT_POLICY"])
@@ -769,6 +777,13 @@ if rr.get("decided_by") == "policy":
     # through to the ladder rather than do nothing at all. The shipped Settings
     # presets use full ids, so terminating here disabled spawn routing outright
     # for every keyed pilot that picked one.
+
+# A Nadir worker is a choice the agent made itself (see the request block).
+# Organization governance and an explicit policy pin, both above, still apply.
+_pick = str(ti.get("subagent_type") or "")
+if _pick.startswith("nadir-route:") or _pick in ("nadir-simple", "nadir-medium"):
+    LOG["why"] = "the agent picked this worker"
+    raise SystemExit
 
 # THE correctness check for automatic routing. The server owns the tokenizer,
 # so it is the only party that knows whether the decision was made from a

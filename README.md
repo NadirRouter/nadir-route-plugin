@@ -44,6 +44,27 @@ Follow it live:
 python3 ~/.claude/plugins/cache/nadir/nadir-route/*/scripts/route_log.py -f
 ```
 
+0.8.8 never moves a spawn above the model its agent definition sets: a Haiku
+agent that names no model stays on Haiku when Nadir says medium.
+
+0.9.0 lets Claude decide. The prompt hook no longer gives an order. It gives
+Nadir's read (the tier odds), its pick and the options, and Claude chooses: do
+the work itself, or hand it to one of five **worker agents** this plugin ships,
+each a fixed model and effort:
+
+| Worker | Model | Effort |
+|---|---|---|
+| `nadir-route:haiku` | Haiku | none (Haiku takes no effort setting) |
+| `nadir-route:sonnet-low` | Sonnet | low |
+| `nadir-route:sonnet-medium` | Sonnet | medium |
+| `nadir-route:sonnet-high` | Sonnet | high |
+| `nadir-route:opus-medium` | Opus | medium |
+
+Workers are how a subagent's effort gets set at all: Claude Code's Agent tool
+has no effort field, and it tells Claude to set `model` only when you ask for
+one. A worker Claude picks is left exactly as chosen; the spawn hook still logs
+Nadir's tier beside it, so the dashboard shows both.
+
 Nadir is a **decision engine here, not a gateway**. Your prompts and completions
 go straight from Claude Code to Anthropic on your own auth; Nadir is consulted
 out of band with the spawn's task text and never sees the request, the response,

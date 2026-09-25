@@ -7,13 +7,18 @@ description: "Explains that this session's prompts and subagent spawns are alrea
 
 This plugin routes at two points. A `UserPromptSubmit` hook asks Nadir's
 decision API which tier each prompt needs, priced against the model this session
-runs, and when a cheaper tier suffices it asks you to delegate that work to a
-subagent on it (you will see the request as hook context on the prompt; a
-`systemMessage` shows the user the same decision). A `PreToolUse` hook on the
-`Agent` tool then asks the same question about every spawn and rewrites `model`
-in its input. Your main thread stays on the model the user chose; the switch
-happens in a fresh subagent, where no prompt cache is lost. If a prompt needs
-conversation context a brief cannot carry, keep it inline and say so.
+runs, and when a cheaper tier suffices it gives you Nadir's read (the tier
+odds), its pick and the cheaper options, as hook context on the prompt (a
+`systemMessage` shows the user the same pick). You decide: do the work yourself,
+or hand it off. Installed as a plugin, the options are Nadir workers, each a
+fixed model and effort (`nadir-route:haiku`, `nadir-route:sonnet-low`,
+`nadir-route:sonnet-medium`, `nadir-route:sonnet-high`,
+`nadir-route:opus-medium`); otherwise, the Agent tool's `model`. Handing off pays
+for multi-step work you can brief completely; a one-step change, or work that
+needs this conversation, is cheaper done yourself. A `PreToolUse` hook on the
+`Agent` tool asks the same question about every other spawn and rewrites `model`
+in its input; a worker you picked is left as you chose. Your main thread stays on
+the model the user chose, and a handoff happens in a fresh subagent.
 
 For Superpowers sessions, use the full skill's `references/superpowers.md`
 active companion and set `NADIR_ROUTE_DISABLE=1` in the host session. Execute

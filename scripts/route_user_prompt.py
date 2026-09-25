@@ -5,10 +5,20 @@ The spawn hooks only ever fire when the agent decides to delegate, which on a
 normal session is rarely, so an installed Nadir routed almost nothing unless
 the user asked for subagents by name. This hook closes that gap. On every
 prompt it asks /v1/bucket which tier the prompt needs, priced against the model
-the session is running, and when a cheaper tier suffices it tells the agent to
-delegate the work to a subagent on that tier. The main thread keeps its model
-and its warm prompt cache; the switch happens where it is free, in a fresh
-subagent, and the spawn hook then sees that spawn like any other.
+the session is running, and when a cheaper tier suffices it gives the agent
+Nadir's read (the tier odds), its pick, and the cheaper options. The agent
+decides: do the work itself, or hand it to a subagent. It sees the whole
+conversation and the classifier sees only this prompt, so the pick informs the
+choice rather than making it. The main thread keeps its model and its warm
+prompt cache; a handoff happens in a fresh subagent, and the spawn hook then
+sees that spawn like any other.
+
+Model AND effort. As a plugin, the options are the worker agents shipped in
+agents/ (WORKERS below), each a fixed model and effort. That is the only way to
+set a subagent's effort in Claude Code: the Agent tool has no effort field, and
+its description tells the model to set `model` only when the user asks for one
+(2.1.280). Choosing an agent type carries no such rule. Installed without the
+plugin there are no workers, and the options are the Agent tool's `model`.
 
 Two harnesses, one file. With NADIR_CODEX_LADDER set it speaks Codex: the
 session model is stated on the hook payload, the ladder maps tiers to catalog
@@ -32,6 +42,7 @@ import re
 import sys
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 
 ALIASES = ("haiku", "sonnet", "opus", "fable")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -40,6 +51,45 @@ MAX_PROMPT_CHARS = 1362
 OPAQUE_BRIEF = re.compile(r"gAAAAA[A-Za-z0-9_-]{40,}={0,2}")
 # The decision this prompt got, for the local log; filled once /v1/bucket answers.
 LAST = {}
+# The plugin's worker agents, cheapest first: (agent name, model alias, effort).
+# test_route_spawn.py holds this table to agents/*.md so the two cannot drift.
+WORKERS = (("haiku", "haiku", None), ("sonnet-low", "sonnet", "low"),
+           ("sonnet-medium", "sonnet", "medium"), ("sonnet-high", "sonnet", "high"),
+           ("opus-medium", "opus", "medium"))
+# The effort a tier gets when the plan states none, as bucket_plan.EFFORT_BY_TIER.
+TIER_EFFORT = {"simple": "low", "medium": "medium", "complex": "xhigh"}
+
+
+def _plugin_prefix():
+    """ "<plugin>:" when this runs from the plugin with its workers beside it, else None."""
+    root = Path(__file__).resolve().parents[1]
+    try:
+        name = json.loads((root / ".claude-plugin" / "plugin.json").read_text()).get("name")
+    except Exception:
+        return None
+    if not isinstance(name, str) or not all((root / "agents" / (w + ".md")).is_file() for w, _, _ in WORKERS):
+        return None
+    return name + ":"
+
+
+def _worker_for(alias, effort, tier):
+    """The worker running `alias` at the effort nearest the plan's, or None."""
+    want = EFFORTS.index(effort if effort in EFFORTS else TIER_EFFORT.get(tier, "high"))
+    options = [(w, e) for w, a, e in WORKERS if a == alias]
+    if not options:
+        return None
+    return min(options, key=lambda o: abs(EFFORTS.index(o[1] or "low") - want))[0]
+
+
+def _odds(resp):
+    """ "simple 88%, medium 10%, complex 2%" from the class probabilities, else the confidence."""
+    probs = resp.get("probabilities")
+    if isinstance(probs, dict) and all(isinstance(probs.get(t), (int, float)) for t in TIERS):
+        return ", ".join("%s %d%%" % (t, round(probs[t] * 100)) for t in TIERS)
+    try:
+        return "confidence %.2f" % float(resp.get("confidence"))
+    except (TypeError, ValueError):
+        return None
 
 
 def log_event(entry):
@@ -289,32 +339,43 @@ def decide(hook, env, now=None):
     selected = resp.get("selected_model") if "selected_model" in resp else ladder.get(tier)
     if not isinstance(selected, str) or selected not in ladder.values() or selected == baseline:
         return None
-    try:
-        conf = float(resp.get("confidence"))
-        conf_text = f"confidence {conf:.2f}; "
-    except (TypeError, ValueError):
-        conf_text = ""
-    head = (f"Nadir routing (automatic hook, not the user): this prompt classifies as tier {tier} "
-            f"({conf_text}the classifier saw the whole prompt). Delegate the work: ")
-    tail = (" with a complete, self-contained brief (files, acceptance criteria, constraints), "
-            "then check the result and answer. Do this without asking. Keep the work inline only "
-            "if it needs conversation context a brief cannot carry, or the user pinned a model in "
-            "this prompt.")
+    odds = _odds(resp)
+    read = (f"Nadir routing (automatic hook, not the user). Nadir reads this prompt as {tier} "
+            f"({odds + '; ' if odds else ''}the classifier saw the whole prompt). ")
+    you = (f"You run {baseline}" + (f" at {effort} effort" if effort else "") + ". ") if baseline else ""
+    handoff = ("Handing off pays for multi-step work you can brief completely; a one-step change, or work "
+               "that needs this conversation, is cheaper done yourself. If you hand off, give a complete "
+               "brief (files, acceptance criteria, constraints) and check the result.")
+    chosen = resp.get("selected_effort") if "selected_model" in resp else plan.get("effort")
+    cheaper = ", ".join(f'"{m}"' for m in ladder.values())  # TIERS order, so cheapest first
     if codex_ladder:
-        chosen = resp.get("selected_effort") if "selected_model" in resp else plan.get("effort")
         # Codex validates the effort against the child model, so only families
         # whose catalog entries accept every value in EFFORTS carry one. The
         # GPT-6 rungs (luna, sol, astra) accept low through max in the Codex
-        # 0.155 catalog; without the clause a Luna child inherits the parent
-        # effort, often xhigh.
-        effort_text = (f' and reasoning_effort "{chosen}"'
-                       if isinstance(chosen, str) and chosen in EFFORTS
-                       and selected.startswith(("gpt-5.6", "gpt-6")) else "")
-        directive = (head + f'call spawn_agent with model "{selected}"{effort_text}' + tail +
-                     " The user installed this routing, so naming the model here is what they asked for.")
-    else:
-        directive = head + f'use the Agent tool with model "{selected}" (subagent_type "general-purpose")' + tail
-    return {"tier": tier, "model": selected, "directive": directive}
+        # 0.155 catalog; without it a Luna child inherits the parent effort,
+        # often xhigh.
+        efforts_ok = lambda slug: slug.startswith(("gpt-5.6", "gpt-6"))
+        suggestion = f'spawn_agent with model "{selected}"' + (
+            f' and reasoning_effort "{chosen}"' if isinstance(chosen, str) and chosen in EFFORTS
+            and efforts_ok(selected) else "")
+        choice = (" and a reasoning_effort (low, medium, high or xhigh)"
+                  if all(efforts_ok(m) for m in ladder.values()) else "")
+        directive = (read + f"Its pick: {suggestion}. " + you + "You decide: do it yourself, or call "
+                     f"spawn_agent with a cheaper model ({cheaper}){choice}. " + handoff +
+                     " The user installed this routing, so choosing the model here is what they asked for.")
+        return {"tier": tier, "model": selected, "suggestion": selected, "directive": directive}
+    prefix = _plugin_prefix()
+    worker = _worker_for(selected, chosen, tier) if prefix else None
+    if worker:
+        names = ", ".join(prefix + w for w, _, _ in WORKERS)
+        directive = (read + f"Its pick: the {prefix}{worker} worker. " + you + "You decide: do it yourself, "
+                     f"or hand it to a Nadir worker with the Agent tool (subagent_type {names}; each runs a "
+                     "fixed model and effort, cheapest first). " + handoff)
+        return {"tier": tier, "model": selected, "suggestion": prefix + worker, "directive": directive}
+    directive = (read + f'Its pick: the Agent tool with model "{selected}" (subagent_type "general-purpose"). '
+                 + you + f"You decide: do it yourself, or hand it off with the Agent tool and a cheaper "
+                 f"model ({cheaper}). " + handoff)
+    return {"tier": tier, "model": selected, "suggestion": selected, "directive": directive}
 
 
 def main():
@@ -325,13 +386,14 @@ def main():
     result = decide(hook, os.environ)
     if LAST:
         log_event(dict(LAST, event="prompt", session=hook.get("session_id"),
-                       action="delegate" if result else "stay"))
+                       action="suggest" if result else "stay",
+                       suggested=result["suggestion"] if result else None))
     if not result:
         return
     print(json.dumps({
         "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                "additionalContext": result["directive"]},
-        "systemMessage": f"Nadir: tier {result['tier']}, delegating to {result['model']}",
+        "systemMessage": f"Nadir: tier {result['tier']}, suggests {result['suggestion']}",
     }))
 
 
