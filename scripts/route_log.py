@@ -26,8 +26,11 @@ def describe(e):
     if kind == "prompt":
         conf = e.get("confidence")
         conf = f" {conf:.2f}" if isinstance(conf, (int, float)) else ""
-        what = (f"prompt   tier {e.get('tier')}{conf}  Nadir -> {e.get('nadir_pick')}  "
-                f"session {e.get('session_model') or '(first prompt)'}  {e.get('action')}")
+        if e.get("why"):
+            what = f"prompt   {e['why']}  session {e.get('session_model') or '(first prompt)'}  {e.get('action')}"
+        else:
+            what = (f"prompt   tier {e.get('tier')}{conf}  Nadir -> {e.get('nadir_pick')}  "
+                    f"session {e.get('session_model') or '(first prompt)'}  {e.get('action')}")
     elif kind == "spawn":
         applied = e.get("applied") or "unchanged"
         tier = f"tier {e.get('tier')}  Nadir -> {e.get('nadir_pick')}" if e.get("tier") else "no decision"

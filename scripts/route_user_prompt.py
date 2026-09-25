@@ -257,14 +257,20 @@ def decide(hook, env, now=None):
     except Exception:
         if not env.get("NADIR_API_KEY"):
             body["agent_policy"] = {"main": "auto"}
+    harness = "codex" if codex_ladder else "claude-code"
     try:
         resp = _post(body)
-    except Exception:
+    except Exception as error:
+        # A timeout or a refused call is logged too: silence here reads exactly
+        # like routing that never ran.
+        LAST.update({"harness": harness, "session_model": baseline or None,
+                     "why": "no decision (%s)" % type(error).__name__})
         return None
     if not isinstance(resp, dict):
+        LAST.update({"harness": harness, "session_model": baseline or None, "why": "no decision (bad response)"})
         return None
     _plan = resp.get("plan") if isinstance(resp.get("plan"), dict) else {}
-    LAST.update({"harness": "codex" if codex_ladder else "claude-code",
+    LAST.update({"harness": harness,
                  "tier": str(resp.get("routing_tier") or _plan.get("tier") or resp.get("bucket") or "") or None,
                  "confidence": resp.get("confidence") if isinstance(resp.get("confidence"), (int, float)) else None,
                  "session_model": baseline or None,
