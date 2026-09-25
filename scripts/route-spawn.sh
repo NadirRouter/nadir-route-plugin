@@ -10,7 +10,13 @@
 # and their generation.
 #
 # `complex` is never rewritten: the top tier stays on the model the session is
-# already running, whichever Opus (or Fable) that is.
+# already running, whichever Opus (or Fable) that is. One exception, Explore,
+# the read-only search agent: since Claude Code 2.1.280 it inherits the session
+# model (capped at opus), and the classifier rates nearly every real search
+# brief complex (11 of 12 sampled, at 0.93 or higher), so every search ran on
+# the frontier model. Claude Code ran Explore on Haiku before that. An Explore
+# spawn that names no model therefore takes the rung below on complex: sonnet,
+# never a move up or level. NADIR_EXPLORE_COMPLEX=inherit turns that off.
 #
 # Transport and malformed-response failures leave the spawn untouched. A
 # model-policy denial from the server blocks it.
@@ -44,7 +50,8 @@
 # CLAUDE_EFFORT (set by the harness, not by you: the session's effort level,
 # forwarded as baseline_effort so the top tier is never told to think less),
 # NADIR_CLAUDE_LADDER (tier->alias JSON; a tier mapped to "inherit" or omitted
-# is left untouched), NADIR_API_KEY (keyed mode: your account's saved agent
+# is left untouched), NADIR_EXPLORE_COMPLEX (alias a complex Explore search
+# takes, default sonnet; inherit keeps it on the session model), NADIR_API_KEY (keyed mode: your account's saved agent
 # policy governs the decision and it shows up in the dashboard's Engine
 # decisions; an explicit NADIR_AGENT_POLICY still wins over the account policy).
 
@@ -458,6 +465,11 @@ if _raw_ladder:
         _ladder.update(json.loads(_raw_ladder))
     except Exception:
         pass
+# Explore, the read-only search agent, takes a complex rung (see the header).
+# Only an inherited spawn: a model named on the call is left to the caller, and
+# an explicit complex entry in NADIR_CLAUDE_LADDER wins.
+if ti.get("subagent_type") == "Explore" and not ti.get("model"):
+    _ladder.setdefault("complex", (os.environ.get("NADIR_EXPLORE_COMPLEX") or "sonnet").strip().lower())
 # Declare the same no-upgrade boundary the response handler enforces. Otherwise
 # an inherited Haiku session advertises a Sonnet swap that it will never apply.
 _aliases = ("haiku", "sonnet", "opus", "fable")
@@ -628,6 +640,9 @@ if _raw_ladder:
         ladder.update(json.loads(_raw_ladder))
     except Exception:
         raise SystemExit  # a malformed ladder is not a licence to guess
+# The Explore complex rung, mirrored for responses that carry no selected_model.
+if ti.get("subagent_type") == "Explore" and not ti.get("model"):
+    ladder.setdefault("complex", (os.environ.get("NADIR_EXPLORE_COMPLEX") or "sonnet").strip().lower())
 
 # Lowercased so a ladder written {"simple":"HAIKU"} routes instead of silently
 # no-opping; the requested-model check below is already case-insensitive.

@@ -23,6 +23,13 @@ silent there, which left every session that opens with its task, and every
 Haiku, the cheapest alias, which cannot be a move up from any session model;
 medium waits for the next prompt, once the model is on record.
 
+0.8.3 routes Claude Code's Explore searches. Explore is the read-only search
+agent; since Claude Code 2.1.280 it inherits the session model (capped at Opus),
+and nearly every real search brief rates complex, so every search ran on the
+frontier model. An Explore spawn that names no model now takes the rung below on
+complex (Sonnet under an Opus session, never level or up).
+`NADIR_EXPLORE_COMPLEX=inherit` turns that off.
+
 Nadir is a **decision engine here, not a gateway**. Your prompts and completions
 go straight from Claude Code to Anthropic on your own auth; Nadir is consulted
 out of band with the spawn's task text and never sees the request, the response,
