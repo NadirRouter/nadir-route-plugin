@@ -58,6 +58,12 @@ WORKERS = (("haiku", "haiku", None), ("sonnet-low", "sonnet", "low"),
            ("opus-medium", "opus", "medium"))
 # The effort a tier gets when the plan states none, as bucket_plan.EFFORT_BY_TIER.
 TIER_EFFORT = {"simple": "low", "medium": "medium", "complex": "xhigh"}
+# A turn the server's size head expects to take at least this many tool calls is
+# long enough that handing routine parts of it off can pay, even when no cheaper
+# model fits the whole task. It is the head's first cut (log1p = 2.19): below it
+# a turn is short, and doing it inline beats the fixed cost of a fresh subagent.
+# ponytail: one fixed cut; tune it against outcome data once handoffs are measured.
+LONG_TOOL_CALLS = 8
 
 
 def _plugin_prefix():
@@ -273,11 +279,9 @@ def decide(hook, env, now=None):
             # off yet, and Claude Code states none on this payload (nor, on a
             # fresh start, on SessionStart). Staying silent here meant a session
             # opened with its task, and every `claude -p`, was never routed.
-            # Haiku is the cheapest alias, so the simple tier cannot be a move
-            # up from any session model; medium waits for a readable baseline.
-            # ponytail: a session started on Haiku is told to delegate to Haiku
-            # once (no saving, one extra hop); its next prompt reads the model.
-            rank = ALIASES.index("haiku") + 1
+            # Both cheaper rungs are offered: the note is information and the
+            # agent, which knows its own model, decides; nothing is priced.
+            rank = ALIASES.index("opus")
         ladder = {"simple": "haiku", "medium": "sonnet"}
         raw = (env.get("NADIR_CLAUDE_LADDER") or "").strip()
         if raw:
@@ -337,17 +341,29 @@ def decide(hook, env, now=None):
     plan = plan if isinstance(plan, dict) else {}
     tier = str(resp.get("routing_tier") or plan.get("tier") or resp.get("bucket") or "")
     selected = resp.get("selected_model") if "selected_model" in resp else ladder.get(tier)
-    if not isinstance(selected, str) or selected not in ladder.values() or selected == baseline:
+    calls = resp.get("expected_tool_calls")
+    calls = calls if type(calls) is int and calls >= 0 else None
+    LAST["tool_calls"] = calls
+    cheaper = isinstance(selected, str) and selected in ladder.values() and selected != baseline
+    # No cheaper model fits the whole task (complex, or the session already sits
+    # at the pick), but a long one still has routine parts worth handing off.
+    split = not cheaper and calls is not None and calls >= LONG_TOOL_CALLS
+    if not cheaper and not split:
         return None
     odds = _odds(resp)
     read = (f"Nadir routing (automatic hook, not the user). Nadir reads this prompt as {tier} "
-            f"({odds + '; ' if odds else ''}the classifier saw the whole prompt). ")
-    you = (f"You run {baseline}" + (f" at {effort} effort" if effort else "") + ". ") if baseline else ""
+            f"({odds + '; ' if odds else ''}the classifier saw the whole prompt)"
+            + (f" and expects about {calls} tool calls. " if calls is not None else ". "))
+    you = ((f"You run {baseline}" + (f" at {effort} effort" if effort else "") + ". ") if baseline
+           else "Your model is not known yet on a first prompt; hand off only to something cheaper. ")
+    size = f"about {calls} tool calls, " if calls is not None else ""
+    routine = ("Its pick: keep the judgment on your model. The task is long, so routine, well-specified "
+               "parts of it (edits across many files, tests or docs from a clear spec) can go to ")
     handoff = ("Handing off pays for multi-step work you can brief completely; a one-step change, or work "
                "that needs this conversation, is cheaper done yourself. If you hand off, give a complete "
                "brief (files, acceptance criteria, constraints) and check the result.")
     chosen = resp.get("selected_effort") if "selected_model" in resp else plan.get("effort")
-    cheaper = ", ".join(f'"{m}"' for m in ladder.values())  # TIERS order, so cheapest first
+    slugs = ", ".join(f'"{m}"' for m in ladder.values())  # TIERS order, so cheapest first
     if codex_ladder:
         # Codex validates the effort against the child model, so only families
         # whose catalog entries accept every value in EFFORTS carry one. The
@@ -355,27 +371,42 @@ def decide(hook, env, now=None):
         # 0.155 catalog; without it a Luna child inherits the parent effort,
         # often xhigh.
         efforts_ok = lambda slug: slug.startswith(("gpt-5.6", "gpt-6"))
+        choice = (" and a reasoning_effort (low, medium, high or xhigh)"
+                  if all(efforts_ok(m) for m in ladder.values()) else "")
+        tail = " The user installed this routing, so choosing the model here is what they asked for."
+        if split:
+            directive = (read + routine + f"spawn_agent with a cheaper model ({slugs}){choice}. " + you
+                         + "You decide. " + handoff + tail)
+            return {"tier": tier, "model": None, "suggestion": "split",
+                    "summary": f"{size}routine parts to {slugs}", "directive": directive}
         suggestion = f'spawn_agent with model "{selected}"' + (
             f' and reasoning_effort "{chosen}"' if isinstance(chosen, str) and chosen in EFFORTS
             and efforts_ok(selected) else "")
-        choice = (" and a reasoning_effort (low, medium, high or xhigh)"
-                  if all(efforts_ok(m) for m in ladder.values()) else "")
         directive = (read + f"Its pick: {suggestion}. " + you + "You decide: do it yourself, or call "
-                     f"spawn_agent with a cheaper model ({cheaper}){choice}. " + handoff +
-                     " The user installed this routing, so choosing the model here is what they asked for.")
-        return {"tier": tier, "model": selected, "suggestion": selected, "directive": directive}
+                     f"spawn_agent with a cheaper model ({slugs}){choice}. " + handoff + tail)
+        return {"tier": tier, "model": selected, "suggestion": selected,
+                "summary": f"{size}suggests {selected}", "directive": directive}
     prefix = _plugin_prefix()
+    names = ", ".join(prefix + w for w, _, _ in WORKERS) if prefix else ""
+    if split:
+        target = (f"a Nadir worker with the Agent tool (subagent_type {names}; each runs a fixed model "
+                  "and effort, cheapest first). " if prefix else
+                  f"a subagent with the Agent tool and a cheaper model ({slugs}). ")
+        directive = read + routine + target + you + "You decide. " + handoff
+        return {"tier": tier, "model": None, "suggestion": "split",
+                "summary": f"{size}routine parts to a worker", "directive": directive}
     worker = _worker_for(selected, chosen, tier) if prefix else None
     if worker:
-        names = ", ".join(prefix + w for w, _, _ in WORKERS)
         directive = (read + f"Its pick: the {prefix}{worker} worker. " + you + "You decide: do it yourself, "
                      f"or hand it to a Nadir worker with the Agent tool (subagent_type {names}; each runs a "
                      "fixed model and effort, cheapest first). " + handoff)
-        return {"tier": tier, "model": selected, "suggestion": prefix + worker, "directive": directive}
+        return {"tier": tier, "model": selected, "suggestion": prefix + worker,
+                "summary": f"{size}suggests {prefix}{worker}", "directive": directive}
     directive = (read + f'Its pick: the Agent tool with model "{selected}" (subagent_type "general-purpose"). '
                  + you + f"You decide: do it yourself, or hand it off with the Agent tool and a cheaper "
-                 f"model ({cheaper}). " + handoff)
-    return {"tier": tier, "model": selected, "suggestion": selected, "directive": directive}
+                 f"model ({slugs}). " + handoff)
+    return {"tier": tier, "model": selected, "suggestion": selected,
+            "summary": f"{size}suggests {selected}", "directive": directive}
 
 
 def main():
@@ -393,7 +424,7 @@ def main():
     print(json.dumps({
         "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                "additionalContext": result["directive"]},
-        "systemMessage": f"Nadir: tier {result['tier']}, suggests {result['suggestion']}",
+        "systemMessage": f"Nadir: tier {result['tier']}, {result['summary']}",
     }))
 
 

@@ -60,6 +60,12 @@ each a fixed model and effort:
 | `nadir-route:sonnet-high` | Sonnet | high |
 | `nadir-route:opus-medium` | Opus | medium |
 
+0.9.1 adds size. Nadir's turn-size head estimates how many tool calls a prompt
+will take, and the note says so. When no cheaper model fits the whole task but
+the task is long (8+ tool calls), the note still speaks: keep the judgment on
+your model and hand routine, well-specified parts to a worker. A session's first
+prompt now offers Sonnet workers too, not only Haiku.
+
 Workers are how a subagent's effort gets set at all: Claude Code's Agent tool
 has no effort field, and it tells Claude to set `model` only when you ask for
 one. A worker Claude picks is left exactly as chosen; the spawn hook still logs

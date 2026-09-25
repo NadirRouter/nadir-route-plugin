@@ -15,7 +15,10 @@ fixed model and effort (`nadir-route:haiku`, `nadir-route:sonnet-low`,
 `nadir-route:sonnet-medium`, `nadir-route:sonnet-high`,
 `nadir-route:opus-medium`); otherwise, the Agent tool's `model`. Handing off pays
 for multi-step work you can brief completely; a one-step change, or work that
-needs this conversation, is cheaper done yourself. A `PreToolUse` hook on the
+needs this conversation, is cheaper done yourself. The note also gives Nadir's
+size estimate (expected tool calls); on a long task with no cheaper model for the
+whole of it, it suggests keeping the judgment yourself and handing the routine,
+well-specified parts to a worker. A `PreToolUse` hook on the
 `Agent` tool asks the same question about every other spawn and rewrites `model`
 in its input; a worker you picked is left as you chose. Your main thread stays on
 the model the user chose, and a handoff happens in a fresh subagent.
