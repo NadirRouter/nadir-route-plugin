@@ -39,8 +39,14 @@ main thread ran, its round trips, tool calls and tokens, never text) is posted
 to /v1/bucket/outcome against it: at Stop (`--stop`, plugin lane) and again on
 the next prompt, which also covers the installer lane that has no Stop hook.
 
+Scheduled ticks. A /loop or scheduled-task prompt fires the same text every
+time, and the classifier reads the job it describes, not the small check one
+tick is. A long prompt that already ran in the session is therefore a tick, and
+the note tells the agent to hand it to the NADIR_LOOP_WORKER worker (default
+haiku) instead of running it on the session model.
+
 Env: NADIR_ROUTE_DISABLE=1, NADIR_API_KEY (or the plugin's api_key option),
-NADIR_BUCKET_URL, NADIR_OUTCOME_URL, NADIR_TIMEOUT, NADIR_CONTEXT_STATE_DIR,
+NADIR_BUCKET_URL, NADIR_OUTCOME_URL, NADIR_TIMEOUT, NADIR_CONTEXT_STATE_DIR, NADIR_LOOP_WORKER,
 NADIR_MAX_PROMPT_CHARS, NADIR_BASELINE_MODEL (explicit session model; wins),
 NADIR_CLAUDE_LADDER / NADIR_CODEX_LADDER, NADIR_AGENT_POLICY, CLAUDE_EFFORT.
 """
@@ -419,6 +425,72 @@ def report_outcome(hook):
     _background(lambda: _post(body, url=url))
 
 
+LOOP_COMMAND = re.compile(r"^/loop(\s+\d+[smhd])?\s+")
+
+
+def _repeats(hook):
+    """How many times this exact prompt already ran in this session; records this run.
+
+    Claude Code's hook payload does not say whether a prompt was typed or fired
+    by /loop or a scheduled task (2.1.280: prompt, session fields, title), but a
+    scheduled prompt fires verbatim every time: one restaurant session sent the
+    same 123-word check 16 times. So a long prompt seen before in the session is
+    a tick. Short ones ("run it again") are not counted, so a person repeating
+    themselves is not mistaken for a schedule. A dynamic /loop fires its own
+    "/loop [interval] <task>" input, which counts by its task.
+    """
+    text = hook.get("prompt_text") if isinstance(hook.get("prompt_text"), str) else hook.get("prompt")
+    path = _state_path(hook.get("session_id"))
+    if not isinstance(text, str) or path is None:
+        return 0
+    text = LOOP_COMMAND.sub("", text.strip(), count=1)
+    if text.startswith("/") or len(text.split()) < ORDER_MIN_WORDS:
+        return 0
+    path = path.with_name("prompt-seen.json")
+    key = hashlib.sha256(text.encode()).hexdigest()[:16]
+    try:
+        seen = json.loads(path.read_text())
+        seen = seen if isinstance(seen, dict) else {}
+    except (OSError, ValueError):
+        seen = {}
+    count = seen.get(key) if type(seen.get(key)) is int else 0
+    # ponytail: a reset past 500 distinct prompts; an LRU if a session ever needs more.
+    seen = dict(seen if len(seen) < 500 else {}, **{key: count + 1})
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(seen))
+        os.replace(tmp, path)
+    except OSError:
+        return 0  # an unrecorded count would repeat forever; better to not call it a tick
+    return count
+
+
+def _loop_result(runs):
+    """The note for a scheduled tick: hand the whole check to a cheap worker.
+
+    A tick re-sends one fully specified instruction, so it is the clearest case
+    of routine work there is, while the classifier reads the job it describes
+    (the DoorDash check read "complex, 39 tool calls") and never offers a
+    cheaper model. The worker is NADIR_LOOP_WORKER, default the cheapest.
+    """
+    name = os.environ.get("NADIR_LOOP_WORKER") or "haiku"
+    workers = {w: alias for w, alias, _ in WORKERS}
+    name = name if name in workers else "haiku"
+    prefix = _plugin_prefix()
+    target = (f'subagent_type "{prefix}{name}"' if prefix
+              else f'model "{workers[name]}" (subagent_type "general-purpose")')
+    pick = prefix + name if prefix else workers[name]
+    directive = ("Nadir routing (automatic hook, not the user). This prompt is a recurring scheduled check: "
+                 f"the same instruction already ran {runs} time{'s' if runs != 1 else ''} in this session, so it "
+                 "is routine and fully specified. Hand the whole check to a cheaper worker: use the Agent tool "
+                 f"with {target}, pass this prompt verbatim as the brief, then relay the worker's report in one or "
+                 "two lines. Do it yourself only if acting on the result needs a decision that depends on this "
+                 "conversation.")
+    return {"tier": "loop", "model": workers[name], "suggestion": pick, "order": True,
+            "summary": f"tick {runs + 1}, hand off to {pick}", "directive": directive}
+
+
 def _remember(hook, offset):
     """Keep this prompt's decision for its outcome report, or forget the last one."""
     path = _state_path(hook.get("session_id"))
@@ -761,8 +833,17 @@ def main():
         offset = os.path.getsize(hook.get("transcript_path"))
     except (OSError, TypeError):
         offset = None
+    codex = bool(os.environ.get("NADIR_CODEX_LADDER"))
+    # Plan mode asked for a plan, not for the work to start, so a tick there is left alone.
+    runs = (_repeats(hook) if os.environ.get("NADIR_ROUTE_DISABLE") != "1" and not codex
+            and hook.get("permission_mode") != "plan" else 0)
     result = decide(hook, os.environ)
     _remember(hook, offset)
+    if runs:
+        # The decision still goes on record (and its outcome) when one was made;
+        # only the note changes, whatever the classifier read into the job.
+        result = _loop_result(runs)
+        LAST.update(harness="claude-code", loop=runs + 1)
     if LAST:
         log_event(dict(LAST, event="prompt", session=hook.get("session_id"),
                        action=("order" if result.get("order") else "suggest") if result else "stay",
