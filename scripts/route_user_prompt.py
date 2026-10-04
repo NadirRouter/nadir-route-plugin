@@ -32,15 +32,26 @@ change is warranted. Every failure path is exit 0 with no output: no baseline,
 an oversized prompt, a slash command, a network error, a truncated encoder
 view, a warm-cache verdict, a policy pin already in force.
 
-Env: NADIR_ROUTE_DISABLE=1, NADIR_API_KEY, NADIR_BUCKET_URL, NADIR_TIMEOUT,
+The decision is half the record; the other half is what the turn actually ran.
+With a key, each decision carries the session id (X-Nadir-Session-Id) and a
+`prompt_<hex>` join id in `tool_use_id`, and the turn's outcome (the model the
+main thread ran, its round trips, tool calls and tokens, never text) is posted
+to /v1/bucket/outcome against it: at Stop (`--stop`, plugin lane) and again on
+the next prompt, which also covers the installer lane that has no Stop hook.
+
+Env: NADIR_ROUTE_DISABLE=1, NADIR_API_KEY (or the plugin's api_key option),
+NADIR_BUCKET_URL, NADIR_OUTCOME_URL, NADIR_TIMEOUT, NADIR_CONTEXT_STATE_DIR,
 NADIR_MAX_PROMPT_CHARS, NADIR_BASELINE_MODEL (explicit session model; wins),
 NADIR_CLAUDE_LADDER / NADIR_CODEX_LADDER, NADIR_AGENT_POLICY, CLAUDE_EFFORT.
 """
+import hashlib
 import json
+import math
 import os
 import re
 import sys
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -167,8 +178,8 @@ def _last_main_turn(path):
 def _cache_block(entry, model, now):
     """The prompt-cache state of the session, whole or not at all.
 
-    Same reading the skill's session_probe takes: cache_read_input_tokens is
-    the warm prefix, read + creation + input is the current input, the
+    Same reading the skill's session_probe takes: read + creation is
+    the next request's warm prefix, read + creation + input is the current input, the
     ephemeral split names the TTL, the timestamp gives the age. A block with
     an invented zero would tell the server the cache is cold when it is not.
     """
@@ -184,9 +195,11 @@ def _cache_block(entry, model, now):
         return None
     creation = usage.get("cache_creation")
     creation = creation if isinstance(creation, dict) else {}
-    made = count(usage.get("cache_creation_input_tokens")) or 0
-    fresh = count(usage.get("input_tokens")) or 0
-    block = {"model": model, "cached_tokens": read, "ttl": "5m",
+    made = count(usage.get("cache_creation_input_tokens"))
+    fresh = count(usage.get("input_tokens"))
+    if made is None or fresh is None:
+        return None
+    block = {"model": model, "cached_tokens": read + made, "ttl": "5m",
              "current_input_tokens": read + made + fresh}
     if (count(creation.get("ephemeral_1h_input_tokens")) or 0) > (count(creation.get("ephemeral_5m_input_tokens")) or 0):
         block["ttl"] = "1h"
@@ -241,22 +254,187 @@ def _codex_cache(path, model, now):
     return None
 
 
-def _post(body):
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _post(body, session=None, url=None):
     data = json.dumps(body).encode()
     headers = {"Content-Type": "application/json"}
     key = os.environ.get("NADIR_API_KEY")
     if key:
         headers["X-API-Key"] = key
+    # A header, not a body field: /v1/bucket rejects unknown keys, so a body
+    # field would 422 every prompt against a server older than this hook.
+    if isinstance(session, str) and 0 < len(session) <= 200:
+        headers["X-Nadir-Session-Id"] = session
     try:
         timeout = float(os.environ.get("NADIR_TIMEOUT") or 5)
     except ValueError:
         timeout = 5.0
-    req = urllib.request.Request(os.environ.get("NADIR_BUCKET_URL") or "https://api.getnadir.com/v1/bucket",
+    endpoint = url or ((os.environ.get("NADIR_ROUTE_URL") or "https://api.getnadir.com/v1/route")
+                       if body.get("decision_version") == "route-v2" else
+                       (os.environ.get("NADIR_BUCKET_URL") or "https://api.getnadir.com/v1/bucket"))
+    req = urllib.request.Request(endpoint,
                                  data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout) as resp:
         if resp.status != 200:
             return None
-        return json.loads(resp.read())
+        return json.loads(resp.read(2_000_000))
+
+
+def _state_path(session):
+    """This session's prompt-decision file in the hooks' private state dir, or None."""
+    if not isinstance(session, str) or not 0 < len(session) <= 1024:
+        return None
+    root = os.environ.get("NADIR_CONTEXT_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".nadir", "context")
+    return Path(root) / hashlib.sha256(session.encode()).hexdigest() / "prompt-decision.json"
+
+
+def _turn(path, offset):
+    """What the main thread ran since byte `offset` of the transcript, or {}.
+
+    Counters and a model id only, never message text. Turns are distinct
+    requestId, as report-outcome.sh counts them. Claude Code writes one record
+    per content block and repeats the message's usage on each, so usage is kept
+    per message.id, last record wins, and summed once.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            if size < offset:
+                return {}  # the transcript was rewritten (a /compact): nothing to attribute
+            # ponytail: the last 32 MB of a turn; a longer one undercounts its start.
+            fh.seek(max(offset, size - (32 << 20)))
+            raw = fh.read()
+    except (OSError, TypeError):
+        return {}
+    fields = (("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"),
+              ("cache_read_tokens", "cache_read_input_tokens"), ("cache_write_tokens", "cache_creation_input_tokens"))
+    model, last, requests, usages, tools = None, None, set(), {}, 0
+    for line in raw.split(b"\n"):
+        if b'"assistant"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isSidechain"):
+            continue
+        message = entry.get("message") if isinstance(entry.get("message"), dict) else {}
+        if isinstance(message.get("model"), str) and message["model"] not in ("", "<synthetic>"):
+            model = message["model"]
+        if isinstance(entry.get("requestId"), str):
+            requests.add(entry["requestId"])
+        if isinstance(entry.get("timestamp"), str):
+            last = entry["timestamp"]
+        content = message.get("content")
+        if isinstance(content, list):
+            tools += sum(1 for block in content if isinstance(block, dict) and block.get("type") == "tool_use")
+        usage = message.get("usage")
+        if isinstance(usage, dict):
+            usages[message.get("id") or entry.get("uuid")] = usage
+    if model is None:
+        return {}
+    out = {"resolved_model": model[:200], "turns": len(requests), "tool_uses": tools}
+    for key, field in fields:
+        out[key] = sum(u[field] for u in usages.values() if type(u.get(field)) is int and u[field] >= 0)
+    if last:
+        out["last"] = last
+    return out
+
+
+def _background(send):
+    """Run `send` after the hook has returned, so no user waits on a report."""
+    try:
+        if os.fork():
+            return
+    except (AttributeError, OSError):
+        try:
+            send()  # no fork (Windows): inline, bounded by NADIR_TIMEOUT
+        except Exception:
+            pass
+        return
+    try:
+        os.setsid()
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)  # release the harness's pipes, or it waits on this child
+        send()
+    except BaseException:
+        pass
+    finally:
+        os._exit(0)
+
+
+def report_outcome(hook):
+    """Post what the last decided turn ran, against its decision row.
+
+    Keyed only: an anonymous decision writes no row for an outcome to attach
+    to. Reports are cumulative from the prompt and the server merges them per
+    field, so the Stop report and the next prompt's both land safely; a
+    transcript that has not grown since the last report is not sent twice.
+    """
+    key = os.environ.get("NADIR_API_KEY")
+    path = _state_path(hook.get("session_id"))
+    transcript = hook.get("transcript_path")
+    if not key or path is None or not isinstance(transcript, str):
+        return
+    try:
+        state = json.loads(path.read_text())
+        size = os.path.getsize(transcript)
+    except (OSError, ValueError):
+        return
+    join = state.get("tool_use_id")
+    if not isinstance(join, str) or not join or size == state.get("reported_size"):
+        return
+    body = _turn(transcript, int(state.get("offset") or 0))
+    if not body:
+        return
+    last = body.pop("last", None)
+    try:
+        took = datetime.fromisoformat(last.replace("Z", "+00:00")) - datetime.fromisoformat(state["started"])
+        if took.total_seconds() >= 0:
+            body["duration_ms"] = int(took.total_seconds() * 1000)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    body["tool_use_id"] = join
+    try:
+        path.write_text(json.dumps(dict(state, reported_size=size)))
+    except OSError:
+        return
+    log_event({"harness": "claude-code", "event": "outcome", "session": hook.get("session_id"),
+               "tool_use_id": join, "resolved_model": body["resolved_model"],
+               "turns": body["turns"], "tool_uses": body["tool_uses"]})
+    bucket = os.environ.get("NADIR_BUCKET_URL")
+    route = os.environ.get("NADIR_ROUTE_URL") or ""
+    if not bucket and route.rstrip("/").endswith("/v1/route"):
+        bucket = route.rstrip("/")[: -len("/route")] + "/bucket"
+    # Same host as the decision: an on-prem or test decision URL must not send
+    # its outcomes to the hosted API.
+    url = os.environ.get("NADIR_OUTCOME_URL") or (bucket.rstrip("/") + "/outcome" if bucket
+                                                  else "https://api.getnadir.com/v1/bucket/outcome")
+    _background(lambda: _post(body, url=url))
+
+
+def _remember(hook, offset):
+    """Keep this prompt's decision for its outcome report, or forget the last one."""
+    path = _state_path(hook.get("session_id"))
+    if path is None:
+        return
+    try:
+        if LAST.get("tool_use_id") and offset is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"tool_use_id": LAST["tool_use_id"], "offset": offset,
+                                       "started": datetime.now(timezone.utc).isoformat()}))
+            os.replace(tmp, path)
+        elif path.exists():
+            path.unlink()  # an undecided prompt: its turn belongs to no decision
+    except OSError:
+        pass
 
 
 def decide(hook, env, now=None):
@@ -286,6 +464,7 @@ def decide(hook, env, now=None):
     if len(text) > (max_chars if max_chars > 0 else MAX_PROMPT_CHARS):
         return None
 
+    strict = env.get("NADIR_DECISION_VERSION", "route-v2") == "route-v2"
     baseline = (env.get("NADIR_BASELINE_MODEL") or "").strip()
     codex_ladder = env.get("NADIR_CODEX_LADDER")
     cache = None
@@ -310,16 +489,20 @@ def decide(hook, env, now=None):
         # gpt-6-sol session over a gpt-5.6 ladder and sent its complex prompts to
         # gpt-5.6-sol, older and twice the price. Unplaceable means abstain.
         position = next((i for i, t in enumerate(TIERS) if slugs.get(t) == baseline), None)
-        if position is None:
-            return None
-        ladder = {t: slugs[t] for i, t in enumerate(TIERS) if t in slugs and i < position}
+        if strict:
+            # V2 prices the observed baseline directly; a new session model
+            # need not occupy an old ladder rung to compare a verified menu.
+            ladder = {t: m for t, m in slugs.items() if m != baseline}
+        else:
+            if position is None:
+                return None
+            ladder = {t: slugs[t] for i, t in enumerate(TIERS) if t in slugs and i < position}
         source = "codex-hook"
         # The cache is part of the decision: a warm session makes staying cheaper.
         cache = _codex_cache(hook.get("transcript_path"), baseline, now or datetime.now(timezone.utc))
     else:
-        entry = None
+        entry = _last_main_turn(hook.get("transcript_path"))
         if not baseline:
-            entry = _last_main_turn(hook.get("transcript_path"))
             baseline = str(((entry or {}).get("message") or {}).get("model") or "").strip()
         if baseline:
             alias = next((a for a in ALIASES if baseline.lower() == a or baseline.lower().startswith("claude-" + a + "-")), None)
@@ -343,7 +526,7 @@ def decide(hook, env, now=None):
                 pass
         ladder = {t: a.strip().lower() for t, a in ladder.items()
                   if a.strip().lower() in ALIASES and ALIASES.index(a.strip().lower()) < rank}
-        if entry is not None:
+        if entry is not None and ((entry.get("message") or {}).get("model") == baseline):
             cache = _cache_block(entry, baseline, now or datetime.now(timezone.utc))
         stated = (env.get("CLAUDE_EFFORT") or "").strip().lower()
         effort = stated if stated in EFFORTS else None
@@ -374,9 +557,38 @@ def decide(hook, env, now=None):
     except Exception:
         if not env.get("NADIR_API_KEY"):
             body["agent_policy"] = {"main": "auto"}
+    if env.get("NADIR_API_KEY") and not codex_ladder:
+        # The join key for this turn's outcome (report_outcome): the role Claude
+        # Code's own tool_use_id plays for a spawn. Keyed only, since an
+        # anonymous decision writes no row, and Claude Code only, since the
+        # outcome is read off its transcript.
+        body["tool_use_id"] = "prompt_" + uuid.uuid4().hex
     harness = "codex" if codex_ladder else "claude-code"
+    strict = env.get("NADIR_DECISION_VERSION", "route-v2") == "route-v2"
+    if strict:
+        if not baseline:
+            return None
+        if codex_ladder:
+            runnable = {m: m for m in slugs.values()}
+        else:
+            try:
+                runnable = json.loads(env.get("NADIR_CLAUDE_MODELS", "{}"))
+                if not runnable:
+                    runnable = {a: env.get("ANTHROPIC_DEFAULT_" + a.upper() + "_MODEL") for a in ALIASES}
+                    runnable = {a: m for a, m in runnable.items() if m}
+                if not isinstance(runnable, dict) or any(a not in ALIASES or not isinstance(m, str) or not m for a, m in runnable.items()):
+                    return None
+            except (ValueError, TypeError):
+                return None
+        baseline = runnable.get(baseline, baseline)
+        if baseline in ALIASES:
+            return None
+        body.pop("ladder", None)
+        body.update(decision_version="route-v2", requested_model=baseline,
+                    menu=list(dict.fromkeys([baseline, *runnable.values()])), axes=["coding", "agentic"],
+                    execution={"model_switch": True, "prompt_rewrite": False, "effort": bool(codex_ladder)})
     try:
-        resp = _post(body)
+        resp = _post(body, hook.get("session_id"))
     except Exception as error:
         # A timeout or a refused call is logged too: silence here reads exactly
         # like routing that never ran.
@@ -386,6 +598,34 @@ def decide(hook, env, now=None):
     if not isinstance(resp, dict):
         LAST.update({"harness": harness, "session_model": baseline or None, "why": "no decision (bad response)"})
         return None
+    if "tool_use_id" in body:
+        LAST["tool_use_id"] = body["tool_use_id"]
+    if strict:
+        decision, bucket = resp.get("decision") or {}, resp.get("bucket") or {}
+        selected, chosen = resp.get("model"), resp.get("effort")
+        amounts = (decision.get("baseline_cost_usd"), decision.get("selected_cost_usd"))
+        LAST.update(harness=harness, session_model=baseline, nadir_pick=selected,
+                    why=decision.get("reason"), request_id=bucket.get("request_id"), decision_version="route-v2")
+        if (decision.get("version") != "route-v2" or decision.get("model") != selected
+                or selected == baseline or selected not in body["menu"] or resp.get("prompt") != text
+                or decision.get("effort") != chosen or (chosen is not None and (not codex_ladder or chosen not in EFFORTS))
+                or bucket.get("input_truncated") is not False or type(bucket.get("encoder_tokens")) is not int or bucket["encoder_tokens"] <= 0
+                or decision.get("ceiling_met") is not True
+                or not all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in amounts)
+                or amounts[1] > amounts[0]):
+            return None
+        alias = next((a for a, model in runnable.items() if model == selected), None)
+        if alias is None:
+            return None
+        dispatch = (f'model "{selected}"' + (f' and reasoning_effort "{chosen}"' if chosen else "")
+                    if codex_ladder else f'model "{alias}" ({selected})')
+        tier = decision.get("required_tier")
+        return {"tier": tier, "model": selected, "suggestion": selected,
+                "summary": f"suggests {selected}; execution not verified",
+                "directive": f"Nadir decision: for an already authorized handoff of this complete task, use {dispatch}. "
+                    "The estimate includes the supplied cache state and stays below the current model baseline. "
+                    "Keep the work inline if delegation is not authorized or would add coordinator overhead. "
+                    "Do not claim measured savings or change the current session model."}
     _plan = resp.get("plan") if isinstance(resp.get("plan"), dict) else {}
     LAST.update({"harness": harness,
                  "tier": str(resp.get("routing_tier") or _plan.get("tier") or resp.get("bucket") or "") or None,
@@ -510,7 +750,19 @@ def main():
         hook = json.load(sys.stdin)
     except Exception:
         return
+    if not os.environ.get("NADIR_API_KEY") and os.environ.get("CLAUDE_PLUGIN_OPTION_API_KEY"):
+        # The plugin's api_key option, entered at enable time; an explicit env key wins.
+        os.environ["NADIR_API_KEY"] = os.environ["CLAUDE_PLUGIN_OPTION_API_KEY"]
+    if os.environ.get("NADIR_ROUTE_DISABLE") != "1" and not os.environ.get("NADIR_CODEX_LADDER"):
+        report_outcome(hook)  # the previous decided turn, now that it is over
+    if "--stop" in sys.argv[1:]:
+        return
+    try:
+        offset = os.path.getsize(hook.get("transcript_path"))
+    except (OSError, TypeError):
+        offset = None
     result = decide(hook, os.environ)
+    _remember(hook, offset)
     if LAST:
         log_event(dict(LAST, event="prompt", session=hook.get("session_id"),
                        action=("order" if result.get("order") else "suggest") if result else "stay",

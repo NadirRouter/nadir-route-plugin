@@ -40,6 +40,9 @@
 # NADIR_CONTEXT_STATE_DIR (default ~/.nadir/context, the compaction hooks' dir).
 
 [ "$NADIR_ROUTE_DISABLE" = "1" ] && { cat >/dev/null 2>&1; exit 0; }
+# The plugin's api_key option, entered at enable time; an explicit env key wins.
+NADIR_API_KEY=${NADIR_API_KEY:-$CLAUDE_PLUGIN_OPTION_API_KEY}
+export NADIR_API_KEY
 
 req=$(cat | python3 -c '
 import json, os, sys, glob, time

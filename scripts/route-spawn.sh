@@ -42,6 +42,9 @@
 # 0 with no stdout, and the spawn keeps whatever model it already had.
 #
 # Env: NADIR_BUCKET_URL, NADIR_TIMEOUT, NADIR_MAX_PROMPT_CHARS, NADIR_AGENT_POLICY (raw JSON), NADIR_ROUTE_DISABLE=1,
+# NADIR_DECISION_VERSION=route-v2 enables the joint guard at NADIR_ROUTE_URL.
+# NADIR_CLAUDE_MODELS is a verified alias->exact-model JSON map (or set the
+# corresponding ANTHROPIC_DEFAULT_*_MODEL variables). Unknown menus abstain.
 # NADIR_TURNS_BY_TYPE (JSON subagent_type -> expected turns; generate it from your
 # own transcripts with `backend/measure_agent_turns.py --json`, never borrow one),
 # NADIR_EXPECTED_TURNS (flat fallback for types absent from that map),
@@ -59,7 +62,12 @@
 
 # Every early exit drains stdin first, so the harness never sees EPIPE on a
 # large tool_input it is still writing.
+NADIR_DECISION_VERSION="${NADIR_DECISION_VERSION:-route-v2}"
+export NADIR_DECISION_VERSION
 [ "$NADIR_ROUTE_DISABLE" = "1" ] && { cat >/dev/null 2>&1; exit 0; }
+# The plugin's api_key option, entered at enable time; an explicit env key wins.
+NADIR_API_KEY=${NADIR_API_KEY:-$CLAUDE_PLUGIN_OPTION_API_KEY}
+export NADIR_API_KEY
 
 # CLAUDE_CODE_SUBAGENT_MODEL outranks a hook's rewrite, so anything but
 # `inherit` makes this hook a guaranteed no-op. Bail before spending a decision
@@ -305,6 +313,8 @@ except (TypeError, ValueError):
 if _max_chars <= 0:
     _max_chars = MAX_PROMPT_CHARS
 if len(prompt) > _max_chars:
+    if os.environ.get("NADIR_DECISION_VERSION") == "route-v2":
+        raise SystemExit  # No legacy Explore fallback outside full coverage.
     _asked = ti.get("model") or None
     _spawn_log = {"event": "spawn", "session": hook.get("session_id"), "tool_use_id": hook.get("tool_use_id"),
                   "subagent_type": ti.get("subagent_type"), "requested": _asked,
@@ -608,6 +618,49 @@ except Exception:
     # no account, so default to letting the router decide.
     if not os.environ.get("NADIR_API_KEY"):
         body["agent_policy"] = {"subagent": "auto"}
+if os.environ.get("NADIR_DECISION_VERSION") == "route-v2":
+    try:
+        models = json.loads(os.environ.get("NADIR_CLAUDE_MODELS", "{}"))
+        if not models:
+            models = {a: os.environ.get("ANTHROPIC_DEFAULT_" + a.upper() + "_MODEL") for a in _aliases}
+            models = {a: m for a, m in models.items() if m}
+        if (not isinstance(models, dict) or not models or
+                any(a not in _aliases or not isinstance(m, str) or not m or len(m) > 200 for a, m in models.items()) or
+                len(set(models.values())) != len(models)):
+            raise ValueError("unknown runnable menu")
+        baseline = models.get(body["requested_model"], body["requested_model"])
+        if baseline in _aliases:
+            raise ValueError("baseline alias unresolved")
+        body.pop("ladder", None)
+        body.update(decision_version="route-v2", requested_model=baseline, menu=list(dict.fromkeys([baseline, *models.values()])),
+                    axes=["coding", "agentic"], execution={
+                        "model_switch": not bool(ti.get("model") or os.environ.get("NADIR_AGENT_MODEL"))
+                            and not (_pick.startswith("nadir-route:") or _pick in ("nadir-simple", "nadir-medium")),
+                        "prompt_rewrite": True, "effort": False})
+        # Parent and child prefixes differ. Report the measured context size
+        # plus new text as an estimate, but leave cache reuse UNKNOWN. V2 then
+        # compares a fully warm baseline against fully written alternatives.
+        if "cache" not in body and hook.get("transcript_path"):
+            with open(hook["transcript_path"], "rb") as transcript:
+                transcript.seek(max(0, os.fstat(transcript.fileno()).st_size - 262144))
+                lines = transcript.read().splitlines()
+            for line in reversed(lines):
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") != "assistant" or entry.get("isSidechain"):
+                        continue
+                    message = entry.get("message") or {}
+                    usage = message.get("usage") or {}
+                    counts = [usage.get(k) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")]
+                    if message.get("model") != baseline or not all(type(n) is int and n >= 0 for n in counts):
+                        break
+                    body["cache"] = {"model": baseline, "current_input_tokens": min(1000000, sum(counts) + len(prompt.encode())),
+                                     "expected_remaining_turns": 1}
+                    break
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    except (ValueError, TypeError, KeyError):
+        raise SystemExit
 print(json.dumps(body))
 ') || exit 0
 [ -n "$req" ] || exit 0
@@ -619,22 +672,30 @@ case "$req" in
     "EMIT "*) printf '%s\n' "${req#EMIT }"; exit 0 ;;
 esac
 
+decision_url="${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}"
+[ "$NADIR_DECISION_VERSION" = "route-v2" ] && decision_url="${NADIR_ROUTE_URL:-https://api.getnadir.com/v1/route}"
 if [ -n "$NADIR_API_KEY" ]; then
+    # The session this spawn belongs to, so its decision row groups with the
+    # prompt decisions of the same session. A UUID-shaped id only, so nothing
+    # else can reach a header; JSON-escaped text inside the prompt cannot match.
+    sid=$(printf '%s' "$hook_input" | sed -n 's/.*"session_id": *"\([A-Za-z0-9-]\{1,200\}\)".*/\1/p' | head -n 1)
+    set --
+    [ -n "$sid" ] && set -- -H "X-Nadir-Session-Id: $sid"
     resp=$(printf '%s' "$req" | curl -s -m "${NADIR_TIMEOUT:-5}" -X POST \
-        "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
-        -H 'Content-Type: application/json' -H "X-API-Key: $NADIR_API_KEY" \
+        "$decision_url" \
+        -H 'Content-Type: application/json' -H "X-API-Key: $NADIR_API_KEY" "$@" \
         --data-binary @- -w '\nNADIR_HTTP_STATUS:%{http_code}') || true
 else
     resp=$(printf '%s' "$req" | curl -s -m "${NADIR_TIMEOUT:-5}" -X POST \
-        "${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}" \
+        "$decision_url" \
         -H 'Content-Type: application/json' --data-binary @- \
         -w '\nNADIR_HTTP_STATUS:%{http_code}') || true
 fi
 # A failed call (timeout, refused, DNS) still reaches the handler below with
 # status 000, so the route log records it; the spawn is left untouched either way.
 
-printf '%s' "$resp" | NADIR_HOOK_INPUT="$hook_input" python3 -c '
-import atexit, builtins, json, os, sys, time
+printf '%s' "$resp" | NADIR_HOOK_INPUT="$hook_input" NADIR_ROUTE_REQUEST="$req" python3 -c '
+import atexit, builtins, json, math, os, sys, time
 
 
 def _route_log(entry):
@@ -688,9 +749,9 @@ LADDER = {"simple": "haiku", "medium": "sonnet"}
 
 try:
     payload, _, status = sys.stdin.read().rpartition("\nNADIR_HTTP_STATUS:")
-    if status == "403":
+    if status in ("403", "409"):
         detail = json.loads(payload).get("detail")
-        if isinstance(detail, dict) and detail.get("error") == "model_not_allowed":
+        if isinstance(detail, dict) and detail.get("error") in ("model_not_allowed", "baseline_policy_conflict"):
             print(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "deny",
                 "permissionDecisionReason": "Nadir organization model policy denied this spawn.",
@@ -701,6 +762,39 @@ try:
                       else "no decision (HTTP %s)" % status)
         raise SystemExit
     body = json.loads(payload)
+    if os.environ.get("NADIR_DECISION_VERSION") == "route-v2":
+        sent = json.loads(os.environ["NADIR_ROUTE_REQUEST"])
+        d = body.get("decision") or {}
+        b = body.get("bucket") or {}
+        model, prompt = body.get("model"), body.get("prompt")
+        baseline = sent["requested_model"]
+        if (d.get("version") != "route-v2" or model not in sent["menu"] or d.get("model") != model
+                or body.get("effort") is not None or d.get("effort") is not None
+                or not isinstance(prompt, str) or not prompt):
+            raise ValueError("invalid joint decision")
+        changed = model != baseline or prompt != sent["prompt"]
+        if changed:
+            amounts = (d.get("baseline_cost_usd"), d.get("selected_cost_usd"))
+            if (not all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in amounts)
+                    or amounts[1] > amounts[0] or d.get("ceiling_met") is not True):
+                raise ValueError("invalid cost ceiling")
+        if model != baseline and (not sent["execution"]["model_switch"] or b.get("input_truncated") is not False
+                                  or type(b.get("encoder_tokens")) is not int or b["encoder_tokens"] <= 0):
+            raise ValueError("unsupported or unverified switch")
+        models = json.loads(os.environ.get("NADIR_CLAUDE_MODELS", "{}"))
+        if not models:
+            models = {a: os.environ.get("ANTHROPIC_DEFAULT_" + a.upper() + "_MODEL") for a in RANK}
+        alias = next((a for a, m in models.items() if m == model and a in RANK), None)
+        if alias is None and model != baseline:
+            raise ValueError("unresolved native model alias")
+        LOG.update(nadir_pick=model, why=d.get("reason"), decision_version="route-v2", request_id=b.get("request_id"))
+        if changed:
+            updated = dict(_ti0, prompt=prompt)
+            if model != baseline:
+                updated["model"] = alias
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                             "permissionDecision": "allow", "updatedInput": updated}}))
+        raise SystemExit
     ti = json.loads(os.environ["NADIR_HOOK_INPUT"]).get("tool_input") or {}
     # str()/isinstance guards: a 200 whose fields are the wrong JSON type must
     # fail open like any other bad response. Without them a list `tier` raises

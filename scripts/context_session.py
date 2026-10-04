@@ -23,6 +23,15 @@ DEFAULT_POLICY = Path(__file__).resolve().parent.parent / "references/cost-disci
 HOOK_LABEL = "Nadir context"
 
 
+def renderer_digest():
+    """A running session must not silently change compaction implementations."""
+    digest = hashlib.sha256()
+    for name in ("context_session.py", "compact_hook.py", "compact_context.py"):
+        digest.update(name.encode())
+        digest.update(Path(__file__).with_name(name).read_bytes())
+    return digest.hexdigest()
+
+
 def private_directory(path):
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
@@ -82,7 +91,7 @@ def handle(event, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000, mode
             policy = raw.decode("utf-8").strip()
         digest = hashlib.sha256(policy.encode()).hexdigest()
         config = {"schema": 1, "mode": mode, "max_chars": max_chars,
-                  "policy": policy, "policy_sha256": digest}
+                  "policy": policy, "policy_sha256": digest, "renderer_sha256": renderer_digest()}
         created = write_json(path, config, replace=source == "clear")
         if not created:
             return {}
@@ -92,6 +101,8 @@ def handle(event, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000, mode
         config = json.loads(path.read_text(encoding="utf-8"))
         if fresh or (kind == "SessionStart" and source != "compact"):
             return {}  # Startup retries and resumes cannot add another policy.
+    if isinstance(config, dict) and config.get("renderer_sha256") != renderer_digest():
+        return {}  # Upgrade takes effect on a new/cleared session; raw archives survive.
     if (not isinstance(config, dict) or config.get("schema") != 1
             or config.get("mode") not in ("preview", "structural") or type(config.get("max_chars")) is not int
             or not 1024 <= config["max_chars"] <= 100000 or not isinstance(config.get("policy"), str)
