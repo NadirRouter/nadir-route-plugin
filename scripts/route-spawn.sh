@@ -34,7 +34,7 @@
 #
 # Only the server tokenizer can verify that the classifier saw the whole
 # input. Automatic changes require input_truncated=false and encoder_tokens>0.
-# NADIR_MAX_PROMPT_CHARS (default 1362) is only a round-trip prefilter; it is
+# NADIR_MAX_PROMPT_CHARS (default 40000) is only a round-trip prefilter; it is
 # not derived from the currently serving analyzer. Raising it does not widen
 # that analyzer's window or bypass the server coverage check.
 #
@@ -254,7 +254,7 @@ req=$(printf '%s' "$hook_input" | python3 -c '
 import json, math, os, sys, time
 
 # Round-trip prefilter only; the server coverage check is authoritative.
-MAX_PROMPT_CHARS = 1362
+MAX_PROMPT_CHARS = 40_000
 
 
 def _route_log(entry):
@@ -390,6 +390,12 @@ if isinstance(_kind, str) and _kind:
 _tuid = hook.get("tool_use_id")
 if isinstance(_tuid, str) and _tuid:
     body["tool_use_id"] = _tuid[:200]
+
+# Opaque identity only: never transmit the transcript path or working directory.
+_sid = hook.get("session_id")
+if (isinstance(_sid, str) and 1 <= len(_sid) <= 200 and _sid[0].isascii()
+        and _sid[0].isalnum() and all(c.isascii() and (c.isalnum() or c in "._:-") for c in _sid)):
+    body["agent_session"] = {"client": "claude-code", "session_id": _sid}
 
 # Turn estimate. Not shipped as a default table anywhere: over 880 real runs on
 # one machine the median was 1 turn for one agent type and 92 for another, so a
@@ -674,23 +680,8 @@ esac
 
 decision_url="${NADIR_BUCKET_URL:-https://api.getnadir.com/v1/bucket}"
 [ "$NADIR_DECISION_VERSION" = "route-v2" ] && decision_url="${NADIR_ROUTE_URL:-https://api.getnadir.com/v1/route}"
-if [ -n "$NADIR_API_KEY" ]; then
-    # The session this spawn belongs to, so its decision row groups with the
-    # prompt decisions of the same session. A UUID-shaped id only, so nothing
-    # else can reach a header; JSON-escaped text inside the prompt cannot match.
-    sid=$(printf '%s' "$hook_input" | sed -n 's/.*"session_id": *"\([A-Za-z0-9-]\{1,200\}\)".*/\1/p' | head -n 1)
-    set --
-    [ -n "$sid" ] && set -- -H "X-Nadir-Session-Id: $sid"
-    resp=$(printf '%s' "$req" | curl -s -m "${NADIR_TIMEOUT:-5}" -X POST \
-        "$decision_url" \
-        -H 'Content-Type: application/json' -H "X-API-Key: $NADIR_API_KEY" "$@" \
-        --data-binary @- -w '\nNADIR_HTTP_STATUS:%{http_code}') || true
-else
-    resp=$(printf '%s' "$req" | curl -s -m "${NADIR_TIMEOUT:-5}" -X POST \
-        "$decision_url" \
-        -H 'Content-Type: application/json' --data-binary @- \
-        -w '\nNADIR_HTTP_STATUS:%{http_code}') || true
-fi
+sid=$(printf '%s' "$hook_input" | sed -n 's/.*"session_id": *"\([A-Za-z0-9-]\{1,200\}\)".*/\1/p' | head -n 1)
+resp=$(printf '%s' "$req" | python3 "$(dirname "$0")/route_transport.py" "$decision_url" "$sid") || true
 # A failed call (timeout, refused, DNS) still reaches the handler below with
 # status 000, so the route log records it; the spawn is left untouched either way.
 

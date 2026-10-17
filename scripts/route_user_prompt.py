@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Nadir UserPromptSubmit hook: right-size the user's prompt, not only the spawns.
 
+NADIR_CLAUDE_MODE=recommend uses /v1/bucket for main-session advice only.
+It never suggests delegation, rewrites a prompt, or claims to switch the main
+model. The delegation behavior described below is the older, separate mode.
+
 The spawn hooks only ever fire when the agent decides to delegate, which on a
 normal session is rarely, so an installed Nadir routed almost nothing unless
 the user asked for subagents by name. This hook closes that gap. On every
@@ -47,6 +51,8 @@ haiku) instead of running it on the session model.
 
 Env: NADIR_ROUTE_DISABLE=1, NADIR_API_KEY (or the plugin's api_key option),
 NADIR_BUCKET_URL, NADIR_OUTCOME_URL, NADIR_TIMEOUT, NADIR_CONTEXT_STATE_DIR, NADIR_LOOP_WORKER,
+NADIR_RECOMMEND_HORIZON_TURNS (recommend mode: how many coming turns a cheaper model
+is assumed to keep, 1..100, default 1; the warm-cache re-write is amortized over them),
 NADIR_MAX_PROMPT_CHARS, NADIR_BASELINE_MODEL (explicit session model; wins),
 NADIR_CLAUDE_LADDER / NADIR_CODEX_LADDER, NADIR_AGENT_POLICY, CLAUDE_EFFORT.
 """
@@ -56,7 +62,9 @@ import math
 import os
 import re
 import sys
-import urllib.request
+import time
+import urllib.parse
+import urllib.error
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,8 +72,13 @@ from pathlib import Path
 ALIASES = ("haiku", "sonnet", "opus", "fable")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 TIERS = ("simple", "medium", "complex")
-MAX_PROMPT_CHARS = 1362
+MAX_PROMPT_CHARS = 40_000  # Request bound; the server verifies encoder coverage.
 OPAQUE_BRIEF = re.compile(r"gAAAAA[A-Za-z0-9_-]{40,}={0,2}")
+# Events the harness queues as prompts: a background task finished, a side
+# session ended its turn, CI changed on a watched PR. In the founder's
+# transcripts 2026-09-25..10-17 they were 5% of the prompts this hook sent,
+# and the effort head read them as big turns (they average ~2 tool calls).
+HARNESS_EVENTS = ("<task-notification>", "<side-sessions-event>", "<ci-monitor-event>")
 # The decision this prompt got, for the local log; filled once /v1/bucket answers.
 LAST = {}
 # The plugin's worker agents, cheapest first: (agent name, model alias, effort).
@@ -260,34 +273,19 @@ def _codex_cache(path, model, now):
     return None
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
 def _post(body, session=None, url=None):
-    data = json.dumps(body).encode()
-    headers = {"Content-Type": "application/json"}
-    key = os.environ.get("NADIR_API_KEY")
-    if key:
-        headers["X-API-Key"] = key
-    # A header, not a body field: /v1/bucket rejects unknown keys, so a body
-    # field would 422 every prompt against a server older than this hook.
-    if isinstance(session, str) and 0 < len(session) <= 200:
-        headers["X-Nadir-Session-Id"] = session
-    try:
-        timeout = float(os.environ.get("NADIR_TIMEOUT") or 5)
-    except ValueError:
-        timeout = 5.0
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("route_transport", os.path.join(os.path.dirname(__file__), "route_transport.py"))
+    transport = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(transport)
     endpoint = url or ((os.environ.get("NADIR_ROUTE_URL") or "https://api.getnadir.com/v1/route")
-                       if body.get("decision_version") == "route-v2" else
+                       if (body or {}).get("decision_version") == "route-v2" else
                        (os.environ.get("NADIR_BUCKET_URL") or "https://api.getnadir.com/v1/bucket"))
-    req = urllib.request.Request(endpoint,
-                                 data=data, headers=headers)
-    with urllib.request.build_opener(NoRedirect()).open(req, timeout=timeout) as resp:
-        if resp.status != 200:
-            return None
-        return json.loads(resp.read(2_000_000))
+    data = json.dumps(body).encode() if body is not None else None
+    status, raw = transport.post(endpoint, data, session=session)
+    if status != 200:
+        raise urllib.error.HTTPError(endpoint, status, "Routing request failed", {}, None)
+    return json.loads(raw)
 
 
 def _state_path(session):
@@ -350,6 +348,46 @@ def _turn(path, offset):
     if last:
         out["last"] = last
     return out
+
+
+def _session_history(hook):
+    """(tool calls of each earlier turn, oldest first, at most 50; earlier turns), or None.
+
+    The server's effort head reads the session as well as the prompt: a session of
+    big turns keeps making big turns, which "ok go" cannot show. Counts only, kept
+    beside the prompt-decision file. Every prompt closes the turn the previous one
+    opened, with the same transcript reading the outcome report uses, and records
+    where its own turn starts. None when it cannot know: no session or transcript,
+    or a session that was already running before this file existed.
+    """
+    path = _state_path(hook.get("session_id"))
+    transcript = hook.get("transcript_path")
+    if path is None or not isinstance(transcript, str):
+        return None
+    path = path.with_name("turn-history.json")
+    try:
+        state = json.loads(path.read_text())
+        state = state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        state = {}
+    calls = [c for c in state.get("calls") or [] if type(c) is int and c >= 0][-50:]
+    turns = state["turns"] if type(state.get("turns")) is int and state["turns"] >= len(calls) else len(calls)
+    known = type(state.get("offset")) is int
+    if known:
+        done = _turn(transcript, state["offset"])
+        if done:
+            calls, turns = (calls + [done["tool_uses"]])[-50:], turns + 1
+    else:
+        known = not _turn(transcript, 0)   # nothing ran yet: this is the session's first turn
+    try:
+        size = os.path.getsize(transcript)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"offset": size, "calls": calls, "turns": turns}))
+        os.replace(tmp, path)
+    except OSError:
+        return None
+    return (calls, turns) if known else None
 
 
 def _background(send):
@@ -509,6 +547,109 @@ def _remember(hook, offset):
         pass
 
 
+def _recommend_horizon(env):
+    """Turns a cheaper model is assumed to keep once recommended: 1 unless
+    NADIR_RECOMMEND_HORIZON_TURNS says more (capped at 100, the server's own
+    cap). One turn prices the cache re-write against a single reply, which a
+    long warm session never wins; a longer horizon amortizes it."""
+    try:
+        turns = int((env.get("NADIR_RECOMMEND_HORIZON_TURNS") or "1").strip())
+    except (ValueError, AttributeError):
+        return 1
+    return min(turns, 100) if turns >= 1 else 1
+
+
+def main_session_advice(resp, baseline, menu, cache=None):
+    """Advice only: a hook cannot change the Desktop main model.
+
+    /bucket's selected_model does NOT incorporate its cache hold. Require the
+    bound, one-turn cache comparison as well as capability/coverage evidence.
+    Cold/expired caches omit the comparison; require lower catalog prices for
+    both input and output instead, as the Terminal Auto validator does.
+    Never turn this recommendation into a child-agent instruction.
+    """
+    if not isinstance(resp, dict):
+        return None
+    selected = resp.get("selected_model")
+    advice = resp.get("cache_advice") or {}
+    ranking = resp.get("ranking") or []
+    if not isinstance(advice, dict) or not isinstance(ranking, list):
+        return None
+    if (not isinstance(selected, str) or selected == baseline or selected not in menu
+            or resp.get("input_truncated") is not False
+            or type(resp.get("encoder_tokens")) is not int or resp["encoder_tokens"] <= 0
+            or resp.get("coverage_held") is True or resp.get("governance_model")
+            or not any(isinstance(r, dict) and r.get("model") == selected
+                       and r.get("eligible") is True for r in ranking)
+            or advice.get("decision") not in {"switch", "cache_expired", "no_warm_cache"}
+            or advice.get("warm_model") != baseline or advice.get("router_model") != selected
+            or type(advice.get("horizon_turns")) is not int
+            or advice["horizon_turns"] != (cache or {}).get("expected_remaining_turns", 1)):
+        return None
+    if advice["decision"] in {"no_warm_cache", "cache_expired"}:
+        cache = cache if isinstance(cache, dict) else {}
+        count, age = cache.get("cached_tokens"), cache.get("seconds_since_last_request")
+        cold = type(count) is int and count == 0
+        expired = (type(count) is int and count >= 0 and cache.get("ttl") in {"5m", "1h"}
+                   and type(age) in (int, float) and math.isfinite(age)
+                   and age >= (3600 if cache["ttl"] == "1h" else 300))
+        policy = resp.get("policy") or {}
+        saving = policy.get("projected_savings_pct") if isinstance(policy, dict) else None
+        if (cache.get("model") != baseline
+                or not (cold if advice["decision"] == "no_warm_cache" else expired)
+                or not isinstance(policy, dict) or policy.get("suppressed") is not False
+                or policy.get("advised_model") != selected or type(saving) not in (int, float)
+                or not math.isfinite(saving) or saving < .05):
+            return None
+        try:
+            url = urllib.parse.urlsplit(os.environ.get("NADIR_BUCKET_URL") or "https://api.getnadir.com/v1/bucket")
+            catalog = _post(None, url=url._replace(path="/v1/models/catalog", query="", fragment="").geturl())
+            canonical = lambda model: re.sub(r"-\d{8}$", "", model)
+            prices = {canonical(row["id"]): row for row in catalog["models"]
+                      if isinstance(row, dict) and isinstance(row.get("id"), str)}
+            a, b = prices.get(canonical(selected), {}), prices.get(canonical(baseline), {})
+            if not all(type(a.get(k)) in (int, float) and type(b.get(k)) in (int, float)
+                       and math.isfinite(a[k]) and math.isfinite(b[k]) and a[k] > 0 and b[k] > 0
+                       and a[k] <= .95 * b[k] for k in ("input_price", "output_price")):
+                return None
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+    else:
+        amounts = (advice.get("stay_cost_usd"), advice.get("switch_cost_usd"))
+        if (not all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in amounts)
+                or amounts[0] <= 0 or amounts[1] > amounts[0] * .95):
+            return None
+    return {"tier": resp.get("routing_tier"), "model": selected, "suggestion": selected,
+            "summary": f"recommends {selected}; main model unchanged",
+            "directive": f"Nadir main-session advice: {selected} is eligible and has a lower estimated "
+                "one-turn cost including the supplied cache state. This is a recommendation, not an "
+                "applied model change. This Desktop hook cannot switch the main model. Continue the "
+                "task inline using the current model unless the user changes it with the native model "
+                "picker or /model. Do not create an Agent, Task, Workflow, or another Claude process "
+                "to enact this recommendation. Do not claim measured savings."}
+
+
+# Env that points Claude Code at a provider whose model ids are not Anthropic's own.
+_THIRD_PARTY_ENV = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "ANTHROPIC_BASE_URL")
+
+
+def _switch_option(env):
+    """The plugin's switch_main_model option, which its hooks module acts on. On by
+    default in the plugin (CLAUDE_PLUGIN_ROOT set, option unset); `false` turns it off.
+    Off outside the plugin, where no module is installed to act on it."""
+    value = (env.get("CLAUDE_PLUGIN_OPTION_SWITCH_MAIN_MODEL") or "").strip().lower()
+    return value in ("true", "1", "yes") if value else bool(env.get("CLAUDE_PLUGIN_ROOT"))
+
+
+def _advice_only(env):
+    """Main-session advice (recommend mode): NADIR_CLAUDE_MODE=recommend, or, with no
+    mode set, the plugin's switch_main_model option. Never under the Codex ladder."""
+    if env.get("NADIR_CODEX_LADDER"):
+        return False
+    mode = env.get("NADIR_CLAUDE_MODE")
+    return mode == "recommend" if mode else _switch_option(env)
+
+
 def decide(hook, env, now=None):
     """Return the directive for this prompt, or None when nothing should change."""
     if env.get("NADIR_ROUTE_DISABLE") == "1" or not isinstance(hook, dict):
@@ -525,9 +666,9 @@ def decide(hook, env, now=None):
     # classify. Oversized text abstains rather than classify a prefix.
     if not text or text.startswith("/") or len(text.split()) < 4 or OPAQUE_BRIEF.fullmatch(text):
         return None
-    # A background-task notification reaches this event as a queued prompt. It
-    # is the harness reporting, not the user asking, so there is nothing to route.
-    if text.startswith("<task-notification>"):
+    # A harness event reaches this event as a queued prompt. It is the harness
+    # reporting, not the user asking, so there is nothing to route.
+    if text.startswith(HARNESS_EVENTS):
         return None
     try:
         max_chars = int(env.get("NADIR_MAX_PROMPT_CHARS") or 0)
@@ -539,6 +680,8 @@ def decide(hook, env, now=None):
     strict = env.get("NADIR_DECISION_VERSION", "route-v2") == "route-v2"
     baseline = (env.get("NADIR_BASELINE_MODEL") or "").strip()
     codex_ladder = env.get("NADIR_CODEX_LADDER")
+    advice_only = _advice_only(env)
+    strict = strict or advice_only
     cache = None
     effort = None
     if codex_ladder:
@@ -607,6 +750,11 @@ def decide(hook, env, now=None):
         return None
 
     body = {"prompt": text, "source": source, "role": "main", "ladder": ladder}
+    session_id = hook.get("session_id")
+    if (isinstance(session_id, str) and 1 <= len(session_id) <= 200
+            and session_id[0].isascii() and session_id[0].isalnum()
+            and all(c.isascii() and (c.isalnum() or c in "._:-") for c in session_id)):
+        body["agent_session"] = {"client": "codex" if codex_ladder else "claude-code", "session_id": session_id}
     context = {}
     if baseline:
         body["requested_model"] = baseline
@@ -622,6 +770,9 @@ def decide(hook, env, now=None):
         context["cache_ttl"] = cache["ttl"]
         if "seconds_since_last_request" in cache:
             context["seconds_since_last_request"] = cache["seconds_since_last_request"]
+    history = hook.get("_nadir_history")
+    if history is not None and not codex_ladder:
+        body["session_history"] = {"prior_tool_calls": history[0], "prior_turns": history[1]}
     if context:
         body["context"] = context
     try:
@@ -629,14 +780,13 @@ def decide(hook, env, now=None):
     except Exception:
         if not env.get("NADIR_API_KEY"):
             body["agent_policy"] = {"main": "auto"}
-    if env.get("NADIR_API_KEY") and not codex_ladder:
+    if env.get("NADIR_API_KEY") and not codex_ladder and not advice_only:
         # The join key for this turn's outcome (report_outcome): the role Claude
         # Code's own tool_use_id plays for a spawn. Keyed only, since an
         # anonymous decision writes no row, and Claude Code only, since the
         # outcome is read off its transcript.
         body["tool_use_id"] = "prompt_" + uuid.uuid4().hex
     harness = "codex" if codex_ladder else "claude-code"
-    strict = env.get("NADIR_DECISION_VERSION", "route-v2") == "route-v2"
     if strict:
         if not baseline:
             return None
@@ -648,6 +798,10 @@ def decide(hook, env, now=None):
                 if not runnable:
                     runnable = {a: env.get("ANTHROPIC_DEFAULT_" + a.upper() + "_MODEL") for a in ALIASES}
                     runnable = {a: m for a, m in runnable.items() if m}
+                if not runnable and _switch_option(env) and not any(env.get(v) for v in _THIRD_PARTY_ENV):
+                    # The switch option with no model list: Haiku by its first-party id.
+                    # Bedrock, Vertex and gateways name models their own way: no default.
+                    runnable = {"haiku": "claude-haiku-4-5"}
                 if not isinstance(runnable, dict) or any(a not in ALIASES or not isinstance(m, str) or not m for a, m in runnable.items()):
                     return None
             except (ValueError, TypeError):
@@ -659,6 +813,27 @@ def decide(hook, env, now=None):
         body.update(decision_version="route-v2", requested_model=baseline,
                     menu=list(dict.fromkeys([baseline, *runnable.values()])), axes=["coding", "agentic"],
                     execution={"model_switch": True, "prompt_rewrite": False, "effort": bool(codex_ladder)})
+    if advice_only:
+        # With no real session accounting, a price comparison would invent the
+        # context size. Wait for a main-thread usage receipt instead.
+        if cache is None:
+            return None
+        body.pop("decision_version", None)
+        body.pop("execution", None)
+        body["source"] = "claude-code-recommend"
+        # context.warm_model invokes the old delegate-vs-inline planner. There
+        # is no child in this mode; cache belongs in the model-switch comparison
+        # below, otherwise an inline verdict masks the cheaper candidate first.
+        body.pop("context", None)
+        if effort:
+            body["context"] = {"baseline_effort": effort}
+        # An authenticated account with no main-role rule passes requested_model
+        # straight through. Ask for model advice explicitly; otherwise even an
+        # eligible Haiku classifier pick gets replaced by Opus before costing.
+        # Keep a caller's explicit role policy and all enforced server governance.
+        body.setdefault("agent_policy", {"main": "auto"})
+        body["policy"] = {"allow_route_up": False, "min_savings_pct": .05}
+        body["cache"] = dict(cache, expected_remaining_turns=_recommend_horizon(env))
     try:
         resp = _post(body, hook.get("session_id"))
     except Exception as error:
@@ -672,6 +847,14 @@ def decide(hook, env, now=None):
         return None
     if "tool_use_id" in body:
         LAST["tool_use_id"] = body["tool_use_id"]
+
+
+    if advice_only:
+        result = main_session_advice(resp, baseline, body["menu"], body["cache"])
+        LAST.update(harness=harness, session_model=baseline, nadir_pick=resp.get("selected_model"),
+                    request_id=resp.get("request_id"), mode="recommend", applied=False,
+                    why="main_model_advice_only" if result else "no_verified_saving")
+        return result
     if strict:
         decision, bucket = resp.get("decision") or {}, resp.get("bucket") or {}
         selected, chosen = resp.get("model"), resp.get("effort")
@@ -817,7 +1000,50 @@ def decide(hook, env, now=None):
             "summary": f"{size}suggests {pick}{saves}", "directive": directive}
 
 
+def desktop_submission(hook, env):
+    """Consume one native pre-send decision, avoiding a second classification."""
+    session, prompt = hook.get("session_id"), hook.get("prompt")
+    if not isinstance(session, str) or not re.fullmatch(r"[0-9a-f-]{36}", session) or not isinstance(prompt, str):
+        return None
+    path = Path.home() / ".nadir/desktop-auto/submissions" / (session + ".json")
+    try:
+        if not path.exists():
+            return None
+        import recommend_outcomes
+        with recommend_outcomes.locked(path.parent, ".consume.lock"):
+            if path.is_symlink() or path.stat().st_size > 4096:
+                return None
+            record = json.loads(path.read_text())
+            path.unlink()  # single use, including a stale or changed draft
+        age = time.time() - record["issued_at"]
+        if (not 0 <= age <= 30 or record.get("session_id") != session
+                or record.get("transcript_path") != hook.get("transcript_path")
+                or record.get("prompt_hash") != hashlib.sha256(prompt.encode()).hexdigest()
+                or record.get("key_hash") != hashlib.sha256(env.get("NADIR_API_KEY", "").encode()).hexdigest()
+                or env.get("NADIR_BUCKET_URL", "https://api.getnadir.com/v1/bucket") != "https://api.getnadir.com/v1/bucket"):
+            return None
+        return record
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def main():
+    # Explicit shell retry uses the same installed settings as Claude. Hook
+    # invocations already receive these variables from the harness.
+    if "--sync-outcomes" in sys.argv[1:]:
+        import recommend_outcomes
+        try:
+            settings = json.loads((Path(__file__).resolve().parent.parent / "settings.json").read_text())
+            for name, value in settings.get("env", {}).items():
+                if name.startswith("NADIR_") and isinstance(value, str):
+                    os.environ.setdefault(name, value)
+        except (OSError, ValueError, AttributeError):
+            pass
+        recommend_outcomes.sync(os.environ, _post, log_event)
+        pending = list((recommend_outcomes.root(os.environ) / "recommend-outbox").glob("*.json"))
+        print(json.dumps({"reporting_enabled": recommend_outcomes.enabled(os.environ),
+                          "pending_outcomes": len(pending)}))
+        return
     try:
         hook = json.load(sys.stdin)
     except Exception:
@@ -825,7 +1051,17 @@ def main():
     if not os.environ.get("NADIR_API_KEY") and os.environ.get("CLAUDE_PLUGIN_OPTION_API_KEY"):
         # The plugin's api_key option, entered at enable time; an explicit env key wins.
         os.environ["NADIR_API_KEY"] = os.environ["CLAUDE_PLUGIN_OPTION_API_KEY"]
-    if os.environ.get("NADIR_ROUTE_DISABLE") != "1" and not os.environ.get("NADIR_CODEX_LADDER"):
+    advice_only = _advice_only(os.environ)
+    if advice_only:
+        import recommend_outcomes
+        try:
+            recommend_outcomes.capture(hook, os.environ)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass  # a local receipt failure must not suppress the next decision
+        if recommend_outcomes.enabled(os.environ):
+            _background(lambda: recommend_outcomes.sync(os.environ, _post, log_event))
+    if (not advice_only and hook.get("hook_event_name") != "StopFailure"
+            and os.environ.get("NADIR_ROUTE_DISABLE") != "1" and not os.environ.get("NADIR_CODEX_LADDER")):
         report_outcome(hook)  # the previous decided turn, now that it is over
     if "--stop" in sys.argv[1:]:
         return
@@ -834,11 +1070,43 @@ def main():
     except (OSError, TypeError):
         offset = None
     codex = bool(os.environ.get("NADIR_CODEX_LADDER"))
+    if not codex and os.environ.get("NADIR_ROUTE_DISABLE") != "1":
+        # Every prompt, routed or not: a skipped "ok go" is still a turn of the session.
+        hook["_nadir_history"] = _session_history(hook)
+    codex_receipts = None
+    if codex:
+        try:
+            import codex_outcomes as codex_receipts
+            codex_receipts.capture(hook)
+            codex_receipts.sync(hook.get("session_id"))
+        except (ImportError, OSError, ValueError, KeyError, TypeError):
+            pass
+    mark = recommend_outcomes.checkpoint(hook) if advice_only else None
+    selected = desktop_submission(hook, os.environ) if advice_only else None
+    if selected:
+        recommend_outcomes.remember(hook, os.environ, selected.get("request_id"), mark)
+        log_event({"harness": "claude-desktop", "mode": "desktop-auto", "event": "prompt",
+                   "session": hook.get("session_id"), "request_id": selected.get("request_id"),
+                   "configured_model": selected.get("model"), "model_evidence": "picker_confirmed",
+                   "why": "native_pre_send_decision", "execution_verified": False})
+        return  # completion hooks supply actual model evidence separately
     # Plan mode asked for a plan, not for the work to start, so a tick there is left alone.
-    runs = (_repeats(hook) if os.environ.get("NADIR_ROUTE_DISABLE") != "1" and not codex
+    runs = (_repeats(hook) if not advice_only and os.environ.get("NADIR_ROUTE_DISABLE") != "1" and not codex
             and hook.get("permission_mode") != "plan" else 0)
+    LAST.clear()
     result = decide(hook, os.environ)
-    _remember(hook, offset)
+    if codex_receipts:
+        try:
+            codex_receipts.remember(hook, LAST.get("request_id"))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    if advice_only:
+        try:
+            recommend_outcomes.remember(hook, os.environ, LAST.get("request_id"), mark)
+        except OSError:
+            pass
+    else:
+        _remember(hook, offset)
     if runs:
         # The decision still goes on record (and its outcome) when one was made;
         # only the note changes, whatever the classifier read into the job.
@@ -853,7 +1121,8 @@ def main():
     print(json.dumps({
         "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                "additionalContext": result["directive"]},
-        "systemMessage": f"Nadir: tier {result['tier']}, {result['summary']}",
+        "systemMessage": (f"Nadir Auto: {result['summary']}" if advice_only
+                          else f"Nadir: tier {result['tier']}, {result['summary']}"),
     }))
 
 

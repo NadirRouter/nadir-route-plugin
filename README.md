@@ -77,6 +77,23 @@ says handing off is cheaper, the note is an order; below that, Claude decides
 from the information. The costing counts your warm prompt cache, so a warm
 session that makes staying cheaper keeps the work where it is.
 
+0.10.0 can switch the main thread's model. With the `switch_main_model` option
+(on by default; set it to `false` to keep every turn on your own model), the
+prompt hook gives main-session advice and a hooks module runs a turn's
+main-thread requests on the cheaper model Nadir suggested, only when its cache
+check prices the switch below staying on your warm model, so a long warm
+session mostly stays. The cheaper model is `claude-haiku-4-5` unless
+`NADIR_CLAUDE_MODELS` or `ANTHROPIC_DEFAULT_HAIKU_MODEL` names another; under
+Bedrock, Vertex or a custom `ANTHROPIC_BASE_URL` nothing switches until you list
+your models. Needs a Claude Code build with hooks modules.
+
+0.11.0 reads the session, not just the prompt. Each prompt records how many tool
+calls the previous turn made (counts only, kept in `~/.nadir/context`) and sends
+the session's turn sizes with the decision, so a terse "ok, next" in the middle
+of a big job is sized as part of that job. Harness messages that arrive as
+prompts (`<side-sessions-event>` and `<ci-monitor-event>`, as well as
+`<task-notification>`) are no longer sent for a decision.
+
 Workers are how a subagent's effort gets set at all: Claude Code's Agent tool
 has no effort field, and it tells Claude to set `model` only when you ask for
 one. A worker Claude picks is left exactly as chosen; the spawn hook still logs

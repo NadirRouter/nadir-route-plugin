@@ -15,9 +15,11 @@ import shlex
 import stat
 import sys
 import tempfile
+import time
 
 sys.dont_write_bytecode = True
 from compact_hook import audit, preview_read, rewrite
+from compact_context import explicit_symbols
 
 DEFAULT_POLICY = Path(__file__).resolve().parent.parent / "references/cost-discipline.md"
 HOOK_LABEL = "Nadir context"
@@ -60,17 +62,67 @@ def write_json(path, value, *, replace=False):
         Path(temporary).unlink(missing_ok=True)
 
 
+def frozen_rewrite(event, *, directory, config, task_symbols=()):
+    """Publish one response per tool invocation, including unchanged results.
+
+    An atomic first-writer-wins receipt makes concurrent retries and process
+    restarts reuse the exact same output and archive path. The raw original
+    must still be recoverable before a compacted receipt can be replayed.
+    """
+    tool_id = event.get("tool_use_id")
+    if not isinstance(tool_id, str) or not 0 < len(tool_id) <= 1024:
+        return {}, {"reason": "tool_identity_unknown"}
+    identity = json.dumps([event.get("agent_id"), tool_id], separators=(",", ":"))
+    epoch = config.get("epoch", "legacy")
+    folder = directory / "results" / epoch
+    private_directory(folder)
+    path = folder / (hashlib.sha256(identity.encode()).hexdigest() + ".json")
+    captured = {key: event.get(key) for key in ("tool_name", "tool_input", "tool_response")}
+    digest = hashlib.sha256(json.dumps(captured, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def read_receipt():
+        if path.is_symlink() or path.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError("invalid tool receipt")
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(receipt, dict) or receipt.get("schema") != 1
+                or not isinstance(receipt.get("output"), dict) or not isinstance(receipt.get("report"), dict)):
+            raise ValueError("invalid tool receipt")
+        if receipt.get("input_sha256") != digest:
+            return {}, {"reason": "tool_identity_reused_with_different_input"}
+        report = receipt["report"]
+        if report.get("compacted"):
+            archive = Path(report["archive_path"])
+            try:
+                if (archive.is_symlink() or not archive.resolve().is_relative_to(directory.resolve())
+                        or archive.stat().st_size > 32 * 1024 * 1024
+                        or hashlib.sha256(archive.read_bytes()).hexdigest() != report.get("sha256")):
+                    return {}, {"reason": "recovery_integrity_failure"}
+            except OSError:
+                return {}, {"reason": "recovery_unavailable"}
+        return receipt["output"], dict(report, receipt_replayed=True)
+
+    if path.exists() or path.is_symlink():
+        return read_receipt()
+    output, report = rewrite(event, mode=config["mode"], archive_dir=directory,
+                             max_chars=config["max_chars"], task_symbols=task_symbols)
+    record = {"schema": 1, "input_sha256": digest, "output": output, "report": report}
+    if write_json(path, record):
+        return output, dict(report, receipt_replayed=False)
+    return read_receipt()
+
+
 def handle(event, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000, mode="structural"):
+    started = time.perf_counter()
     if not isinstance(event, dict) or os.environ.get("NADIR_CONTEXT_DISABLE") == "1":
         return {}
     kind, session_id = event.get("hook_event_name"), event.get("session_id")
-    if kind not in ("SessionStart", "SubagentStart", "PreToolUse", "PostToolUse"):
+    if kind not in ("SessionStart", "SubagentStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"):
         return {}
     if not isinstance(session_id, str) or not 0 < len(session_id) <= 1024:
         return {}
     if not 1024 <= max_chars <= 100000:
         raise ValueError("max_chars must be between 1024 and 100000")
-    if mode not in ("preview", "structural"):
+    if mode not in ("preview", "structural", "task"):
         raise ValueError("unknown compaction mode")
     key = hashlib.sha256(session_id.encode()).hexdigest()
     directory = Path(state_dir) / key
@@ -90,11 +142,13 @@ def handle(event, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000, mode
                 raise ValueError("policy exceeds 32 KiB")
             policy = raw.decode("utf-8").strip()
         digest = hashlib.sha256(policy.encode()).hexdigest()
-        config = {"schema": 1, "mode": mode, "max_chars": max_chars,
+        config = {"schema": 1, "mode": mode, "max_chars": max_chars, "epoch": os.urandom(16).hex(),
                   "policy": policy, "policy_sha256": digest, "renderer_sha256": renderer_digest()}
         created = write_json(path, config, replace=source == "clear")
         if not created:
             return {}
+        if source == "clear":
+            (directory / "task.json").unlink(missing_ok=True)
     else:
         if path.is_symlink():
             raise ValueError("session configuration must not be a symlink")
@@ -104,10 +158,20 @@ def handle(event, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000, mode
     if isinstance(config, dict) and config.get("renderer_sha256") != renderer_digest():
         return {}  # Upgrade takes effect on a new/cleared session; raw archives survive.
     if (not isinstance(config, dict) or config.get("schema") != 1
-            or config.get("mode") not in ("preview", "structural") or type(config.get("max_chars")) is not int
+            or config.get("mode") not in ("preview", "structural", "task") or type(config.get("max_chars")) is not int
             or not 1024 <= config["max_chars"] <= 100000 or not isinstance(config.get("policy"), str)
             or hashlib.sha256(config["policy"].encode()).hexdigest() != config.get("policy_sha256")):
         raise ValueError("invalid pinned session configuration")
+    epoch = config.get("epoch", "legacy")
+    if (not isinstance(epoch, str) or (epoch != "legacy" and
+            (len(epoch) != 32 or any(c not in "0123456789abcdef" for c in epoch)))):
+        raise ValueError("invalid session epoch")
+    if kind == "UserPromptSubmit":
+        # Store just explicit symbol names, not the full user prompt. A later
+        # clarification with no targets clears the selection instead of
+        # guessing that an earlier task still applies.
+        write_json(directory / "task.json", {"symbols": list(explicit_symbols(event.get("prompt")))}, replace=True)
+        return {}
     if kind in ("SessionStart", "SubagentStart"):
         policy = config["policy"]
         # Claude Code deduplicates SubagentStart context and restores it after
@@ -118,18 +182,31 @@ def handle(event, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000, mode
         # 8 KiB would fall back to a head/tail preview and lose the outline.
         output, report = preview_read(event, mode=config["mode"])
     else:
-        output, report = rewrite(event, mode=config["mode"], archive_dir=directory, max_chars=config["max_chars"])
-    audit(directory / "counts.jsonl", event, dict(report, policy_sha256=config["policy_sha256"]))
+        names = ()
+        task_path = directory / "task.json"
+        # A child has its own task. Never reuse a parent's targets for it.
+        if config["mode"] == "task" and not event.get("agent_id") and task_path.exists():
+            if task_path.is_symlink() or task_path.stat().st_size > 65536:
+                raise ValueError("invalid task record")
+            record = json.loads(task_path.read_text(encoding="utf-8"))
+            names = record.get("symbols", []) if isinstance(record, dict) else []
+            if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                raise ValueError("invalid task targets")
+        output, report = frozen_rewrite(event, directory=directory, config=config, task_symbols=names)
+    audit(directory / "counts.jsonl", event, dict(report, policy_sha256=config["policy_sha256"],
+          epoch=epoch, hook_elapsed_ms=(time.perf_counter() - started) * 1000))
     return output
 
 
-def install(project, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000):
+def install(project, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000, mode="structural"):
     """Merge only our hooks into project-local settings; preserve other hooks."""
     project = Path(project).resolve()
     if not project.is_dir():
         raise ValueError("project must be an existing directory")
     if not 1024 <= max_chars <= 100000:
         raise ValueError("max_chars must be between 1024 and 100000")
+    if mode not in ("preview", "structural", "task"):
+        raise ValueError("unknown compaction mode")
     if policy_file is not None:
         policy_file = Path(policy_file).resolve(strict=True)
         if policy_file.stat().st_size > 32768:
@@ -146,11 +223,12 @@ def install(project, *, state_dir, policy_file=DEFAULT_POLICY, max_chars=8000):
         raise ValueError("settings and hooks must be JSON objects")
     hooks = document.setdefault("hooks", {})
     command = [sys.executable, str(Path(__file__).resolve()), "--state-dir", str(state_dir),
-               "--max-chars", str(max_chars)]
+               "--max-chars", str(max_chars), "--mode", mode]
     command += ["--policy-file", str(policy_file)] if policy_file is not None else ["--no-policy"]
     nudge = [sys.executable, str(Path(__file__).resolve().with_name("cache_miss_nudge.py")),
              "--state-dir", str(state_dir)]
     for event, matcher, argv in (("SessionStart", "startup|clear|resume|compact", command),
+                                 ("UserPromptSubmit", None, command),
                                  ("SubagentStart", ".*", command), ("PreToolUse", "Read", command),
                                  ("PostToolUse", "Read|Bash", command), ("Stop", None, nudge)):
         entries = hooks.get(event, [])
@@ -189,12 +267,12 @@ def main():
     policies.add_argument("--policy-file", type=Path, default=DEFAULT_POLICY, help="Pinned when the session starts; may be an exact upstream policy")
     policies.add_argument("--no-policy", action="store_true", help="Use when a behavior policy such as Ponytail is already active")
     parser.add_argument("--max-chars", type=int, default=8000)
-    parser.add_argument("--mode", choices=["structural", "preview"], default="structural", help="Preview is a benchmark control; installation uses structural")
+    parser.add_argument("--mode", choices=["structural", "preview", "task"], default=os.environ.get("NADIR_CONTEXT_MODE", "structural"), help="Task mode retains explicit symbols and direct local callees; unknown targets pass through")
     args = parser.parse_args()
     policy = None if args.no_policy else args.policy_file
     try:
         if args.install_project:
-            settings = install(args.install_project, state_dir=args.state_dir, policy_file=policy, max_chars=args.max_chars)
+            settings = install(args.install_project, state_dir=args.state_dir, policy_file=policy, max_chars=args.max_chars, mode=args.mode)
             print(f"Nadir compaction installed in {settings}. Start a fresh session; existing sessions are unchanged.")
         else:
             raw = sys.stdin.buffer.read(64 * 1024 * 1024 + 1)

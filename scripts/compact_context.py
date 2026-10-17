@@ -16,6 +16,60 @@ import sys
 import tempfile
 
 
+def explicit_symbols(task):
+    """Only explicit backticked identifiers; never guess intent from prose."""
+    if not isinstance(task, str) or len(task) > 65536:
+        return ()
+    names = re.findall(r"(?<!`)`([A-Za-z_]\w*(?:\.\w+)*)`(?!`)", task)
+    return tuple(dict.fromkeys(names)) if len(names) <= 64 else ()
+
+
+def resolve_symbols(text, requested):
+    """Resolve unique definitions and direct local callees; not a full graph.
+
+    Preserve module data separately in python_view. Dynamic dispatch, aliases
+    and external dependencies still require reading the archived original.
+    """
+    index = {}
+
+    def walk(nodes, prefix=""):
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = prefix + node.name
+                if name in index:
+                    raise ValueError("ambiguous_symbol")
+                index[name] = node
+                if isinstance(node, ast.ClassDef):
+                    walk(node.body, name + ".")
+
+    walk(ast.parse(text).body)
+    selected = set()
+    for name in requested:
+        matches = [name] if name in index else [key for key in index if key.rsplit(".", 1)[-1] == name]
+        if len(matches) != 1:
+            raise ValueError("unknown_or_ambiguous_symbol")
+        selected.add(matches[0])
+    todo = list(selected)
+    while todo:
+        name = todo.pop()
+        owner = name.rsplit(".", 1)[0] if "." in name else ""
+        for call in ast.walk(index[name]):
+            if not isinstance(call, ast.Call):
+                continue
+            target = None
+            if isinstance(call.func, ast.Name) and call.func.id in index:
+                target = call.func.id
+            elif (owner and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+                  and call.func.value.id in ("self", "cls")):
+                candidate = owner + "." + call.func.attr
+                if candidate in index:
+                    target = candidate
+            if target and target not in selected:
+                selected.add(target)
+                todo.append(target)
+    return tuple(sorted(selected))
+
+
 def python_view(text, keep_symbols=(), *, lean=False):
     """A source view, never replacement code. Keep named bodies verbatim.
 
@@ -90,14 +144,14 @@ def python_view(text, keep_symbols=(), *, lean=False):
 
 
 def compact_file(path, *, exit_code, max_chars=8000, archive_dir=None, summarize_tests=False,
-                 code_language=None, keep_symbols=()):
+                 code_language=None, keep_symbols=(), task=None):
     if max_chars < 1024:
         raise ValueError("max_chars must be at least 1024 (includes retrieval instructions)")
-    if not isinstance(exit_code, int) or not 0 <= exit_code <= 255:
+    if type(exit_code) is not int or not 0 <= exit_code <= 255:
         raise ValueError("exit_code must be the command's actual status, from 0 to 255")
     if not Path(path).is_file():
         raise ValueError("path must be a regular captured-output file")
-    if code_language not in (None, "python") or (keep_symbols and code_language != "python"):
+    if code_language not in (None, "python") or ((keep_symbols or task is not None) and code_language != "python"):
         raise ValueError("symbol selection requires code_language='python'")
     if summarize_tests and code_language:
         raise ValueError("choose test summaries or code views, not both")
@@ -120,6 +174,16 @@ def compact_file(path, *, exit_code, max_chars=8000, archive_dir=None, summarize
     if exit_code or len(original) <= max_chars:
         report["reason"] = "failed_command_preserved" if exit_code else "below_limit"
         return original, report
+
+    if task is not None or keep_symbols:
+        requested = tuple(keep_symbols) + explicit_symbols(task)
+        if not requested:
+            return original, dict(report, reason="no_explicit_symbol")
+        try:
+            keep_symbols = resolve_symbols(original, requested)
+        except (SyntaxError, ValueError, RecursionError):
+            return original, dict(report, reason="unknown_or_ambiguous_symbol")
+        report["required_symbols"] = list(keep_symbols)
 
     code = python_view(original, keep_symbols) if code_language else None
     if code_language and code is None:
@@ -172,7 +236,7 @@ def compact_file(path, *, exit_code, max_chars=8000, archive_dir=None, summarize
         directory.rmdir()
         raise ValueError("archive path leaves no preview space; increase max_chars")
     detail = "standard"
-    if code is not None and len(code) > available:
+    if code is not None and len(code) > available and not keep_symbols:
         lean = python_view(original, keep_symbols, lean=True)
         if lean is not None and len(lean) < len(code):
             code, detail = lean, "lean"
@@ -213,12 +277,13 @@ def main():
     parser.add_argument("--summarize-tests", action="store_true", help="Summarize recognized passing tests; preserve diagnostics in full")
     parser.add_argument("--code-language", choices=["python"], help="Outline a complete captured Python file; unsupported syntax stays exact")
     parser.add_argument("--keep-symbol", action="append", default=[], help="Keep this function or Class.method body exact; repeat for multiple symbols")
+    parser.add_argument("--task", help="Task with explicit backticked Python symbols; preserve original if intent is unknown")
     args = parser.parse_args()
     try:
         content, report = compact_file(
             args.path, exit_code=args.exit_code, max_chars=args.max_chars, archive_dir=args.archive_dir,
             summarize_tests=args.summarize_tests,
-            code_language=args.code_language, keep_symbols=args.keep_symbol,
+            code_language=args.code_language, keep_symbols=args.keep_symbol, task=args.task,
         )
     except (OSError, UnicodeError, ValueError) as error:
         parser.exit(2, f"nadir compact: {error}. Original file is unchanged.\n")

@@ -14,6 +14,7 @@ from pathlib import Path
 import shlex
 import sys
 import tempfile
+import datetime
 
 sys.dont_write_bytecode = True
 from compact_context import compact_file, python_view
@@ -31,8 +32,16 @@ PYTHON_SUFFIXES = {".py", ".pyi"}
 CODE_SUFFIXES = {".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".hpp", ".cs", ".rb", ".sh", ".swift", ".kt"}
 
 
-def rewrite(event, *, mode, archive_dir, max_chars=8000):
-    if mode not in ("preview", "structural"):
+def recovery_path(path, archive_dir):
+    candidate = Path(path)
+    # Other sessions' archive files also remain exact, but a repository whose
+    # name happens to contain "nadir-context-" is not itself an archive.
+    return (candidate.resolve().is_relative_to(Path(archive_dir).resolve())
+            or (candidate.name == "output.txt" and candidate.parent.name.startswith("nadir-context-")))
+
+
+def rewrite(event, *, mode, archive_dir, max_chars=8000, task_symbols=()):
+    if mode not in ("preview", "structural", "task"):
         raise ValueError("unknown compression mode")
     if not isinstance(event, dict) or event.get("hook_event_name") != "PostToolUse":
         return {}, {"reason": "unsupported_event"}
@@ -46,7 +55,7 @@ def rewrite(event, *, mode, archive_dir, max_chars=8000):
         if response.get("type") != "text" or not isinstance(file, dict):
             return {}, {"reason": "unsupported_read"}
         path = args.get("file_path")
-        if isinstance(path, str) and (str(Path(archive_dir).resolve()) in path or "nadir-context-" in path):
+        if isinstance(path, str) and recovery_path(path, archive_dir):
             return {}, {"reason": "recovery_preserved"}
         if not isinstance(path, str) or Path(path).suffix.lower() not in CODE_SUFFIXES:
             return {}, {"reason": "unsupported_language"}
@@ -56,22 +65,25 @@ def rewrite(event, *, mode, archive_dir, max_chars=8000):
                 or file.get("numLines") != file.get("totalLines")):
             return {}, {"reason": "partial_read_preserved"}
         original = file.get("content")
-        code_language = "python" if mode == "structural" and Path(path).suffix.lower() in (".py", ".pyi") else None
+        code_language = "python" if mode in ("structural", "task") and Path(path).suffix.lower() in (".py", ".pyi") else None
+        if mode == "task" and (code_language is None or not task_symbols):
+            return {}, {"reason": "task_target_unknown"}
     elif tool == "Bash":
         if (response.get("stderr") != "" or response.get("interrupted") is not False
-                or response.get("isImage") is not False or response.get("exitCode", 0) != 0):
+                or response.get("isImage") is not False or type(response.get("exitCode")) is not int
+                or response["exitCode"] != 0):
             return {}, {"reason": "diagnostics_preserved"}
         command = args.get("command")
         if not isinstance(command, str):
             return {}, {"reason": "unsupported_command"}
-        # A recovery through cat/sed/rg must never be compressed again.
-        if str(Path(archive_dir).resolve()) in command or "nadir-context-" in command:
-            return {}, {"reason": "recovery_preserved"}
         original = response.get("stdout")
         try:
             words = shlex.split(command)
         except ValueError:
             return {}, {"reason": "unsupported_command"}
+        # A recovery through cat/sed/rg must never be compressed again.
+        if any(recovery_path(word, archive_dir) for word in words if "/" in word):
+            return {}, {"reason": "recovery_preserved"}
         # ponytail: only a single plain cat is a known complete source capture.
         program = Path(words[0]).name if words else ""
         programs = {Path(word).name for word in words}
@@ -80,7 +92,9 @@ def rewrite(event, *, mode, archive_dir, max_chars=8000):
             return {}, {"reason": "patch_preserved"}
         if (len(words) == 2 and program == "cat" and words[1].endswith(".py")
                 and not words[1].startswith("-")):
-            code_language = "python" if mode == "structural" else None
+            code_language = "python" if mode in ("structural", "task") else None
+            if mode == "task" and not task_symbols:
+                return {}, {"reason": "task_target_unknown"}
         elif programs.intersection(("cat", "sed", "head", "tail", "rg", "grep", "awk")):
             return {}, {"reason": "targeted_read_preserved"}
     else:
@@ -98,8 +112,9 @@ def rewrite(event, *, mode, archive_dir, max_chars=8000):
         captured.flush()
         preview, report = compact_file(captured.name, exit_code=0, max_chars=max_chars,
                                       archive_dir=archive_dir, code_language=code_language,
+                                      keep_symbols=task_symbols if mode == "task" and code_language else (),
                                       summarize_tests=tool == "Bash" and code_language is None)
-        if report["reason"] == "code_view_exceeds_budget":
+        if report["reason"] == "code_view_exceeds_budget" and mode != "task":
             # Auto-navigation can fall back to the existing preview. Explicit
             # --keep-symbol requests use compact_file directly and stay exact.
             preview, report = compact_file(captured.name, exit_code=0, max_chars=max_chars,
@@ -174,7 +189,21 @@ def preview_read(event, *, mode, read_token_cap=READ_TOKEN_CAP):
 
 
 def audit(path, event, report):
-    record = dict(report, tool_name=event.get("tool_name"), tool_use_id=event.get("tool_use_id"))
+    response = event.get("tool_response")
+    captured = response if isinstance(response, str) else None
+    if isinstance(response, dict):
+        file = response.get("file")
+        captured = file.get("content") if isinstance(file, dict) else response.get("stdout")
+    record = dict(report, tool_name=event.get("tool_name"), tool_use_id=event.get("tool_use_id"),
+                  agent_id=event.get("agent_id"), hook_event_name=event.get("hook_event_name"),
+                  observed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  measurement_basis="characters_and_utf8_bytes_not_billed_tokens")
+    if isinstance(captured, str):
+        record["received_chars"] = len(captured)
+        record["received_bytes"] = len(captured.encode("utf-8"))
+        if not report.get("compacted"):
+            record["returned_chars"] = len(captured)
+            record["returned_bytes"] = len(captured.encode("utf-8"))
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     with os.fdopen(os.open(path, flags, 0o600), "a") as log:
         log.write(json.dumps(record) + "\n")
@@ -182,7 +211,8 @@ def audit(path, event, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["preview", "structural"], required=True)
+    parser.add_argument("--mode", choices=["preview", "structural", "task"], required=True)
+    parser.add_argument("--keep-symbol", action="append", default=[])
     parser.add_argument("--archive-dir", type=Path, required=True)
     parser.add_argument("--max-chars", type=int, default=8000)
     parser.add_argument("--audit-log", type=Path, help="Private local counts/recovery receipts; no tool text")
@@ -194,7 +224,8 @@ def main():
         event = json.loads(raw)
         if not isinstance(event, dict):
             return
-        output, report = rewrite(event, mode=args.mode, archive_dir=args.archive_dir, max_chars=args.max_chars)
+        output, report = rewrite(event, mode=args.mode, archive_dir=args.archive_dir, max_chars=args.max_chars,
+                                 task_symbols=args.keep_symbol)
         if args.audit_log:
             audit(args.audit_log, event, report)
         if output:

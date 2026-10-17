@@ -5,6 +5,21 @@ description: Explains Nadir's automatic cache-aware routing and recoverable cont
 
 # Nadir routing and compaction
 
+With `NADIR_CLAUDE_MODE=recommend` (Nadir Auto), the installed hook uses only
+`/v1/bucket` for model advice and local hooks for tool-output compaction. Inference
+stays with Claude Code. Recommendations require complete classifier coverage,
+an eligible model in the configured menu, and a one-turn cache comparison at
+least 5% below the current model's estimated cost. Missing evidence keeps the
+current model. The first turn has no usage receipt, so no recommendation is made.
+
+Desktop hooks cannot apply the recommended main-model switch. The user must use
+the native model picker or `/model`. Continue inline until they do. Never create
+an Agent, Task, Workflow, or another Claude process just to use a cheaper model.
+Do not describe a recommendation or a Skill tool's `model` metadata as proof of
+an applied switch; verify the actual request/response model.
+
+The remaining routing instructions apply to the separate **delegate** mode:
+
 The installed hooks use Decision API v2. They consider the complete task,
 current model, runnable model menu, measured configuration evidence, and cache
 costs together. They apply only a supported recommendation whose estimated cost

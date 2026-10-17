@@ -179,9 +179,7 @@ print(json.dumps(body))
 
 # Backgrounded: a PostToolUse hook runs on the agent's critical path, and a
 # label is never worth making a user wait for.
-printf '%s' "$req" | curl -s -f -m "${NADIR_TIMEOUT:-5}" -X POST \
-    "${NADIR_OUTCOME_URL:-https://api.getnadir.com/v1/bucket/outcome}" \
-    -H 'Content-Type: application/json' -H "X-API-Key: $NADIR_API_KEY" \
-    --data-binary @- >/dev/null 2>&1 &
+printf '%s' "$req" | python3 "$(dirname "$0")/route_transport.py" \
+    "${NADIR_OUTCOME_URL:-https://api.getnadir.com/v1/bucket/outcome}" >/dev/null 2>&1 &
 
 exit 0

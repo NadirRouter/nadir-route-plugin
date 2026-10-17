@@ -8,6 +8,11 @@
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/route_user_prompt.py",
             "timeout": 8
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/context_session.py --state-dir \"$HOME\"/.nadir/context --max-chars 8000 --no-policy",
+            "timeout": 5
           }
         ]
       }
@@ -97,6 +102,20 @@
           }
         ]
       }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/route_user_prompt.py --stop",
+            "timeout": 5
+          }
+        ]
+      }
     ]
-  }
+  },
+  "modules": [
+    "./model_switch.ts"
+  ]
 }
